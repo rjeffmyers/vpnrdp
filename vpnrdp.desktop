@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=VPN+RDP Manager
+Comment=Connect to VPN then RDP with one click
+Exec=/home/jeff/vpnrdp/vpnrdp.py
+Icon=network-workgroup
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=vpn;rdp;remote;desktop;openvpn;freerdp;
