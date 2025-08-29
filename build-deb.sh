@@ -10,7 +10,7 @@ PACKAGE_NAME="vpnrdp"
 VERSION="1.0.0"
 ARCH="all"
 MAINTAINER="VPN+RDP Manager Contributors"
-DESCRIPTION="Combined VPN and RDP connection manager with one-click connect"
+DESCRIPTION="Combined VPN (OpenVPN3/WireGuard) and RDP connection manager with one-click connect"
 
 # Colors for output
 RED='\033[0;31m'
@@ -130,7 +130,8 @@ Depends: python3 (>= 3.10),
          curl,
          gpg,
          apt-transport-https
-Recommends: openvpn3
+Recommends: openvpn3, wireguard
+Suggests: wireguard-tools
 Maintainer: ${MAINTAINER}
 Description: ${DESCRIPTION}
  VPN+RDP Manager is a combined VPN and RDP connection manager for Linux
@@ -138,12 +139,14 @@ Description: ${DESCRIPTION}
  and RDP with a single click.
  .
  Features:
+  - Support for both OpenVPN3 and WireGuard VPN protocols
   - One-click connection to VPN then RDP
-  - Save multiple connection profiles
+  - Save multiple connection profiles with different VPN types
   - Advanced RDP options (multi-monitor, audio, performance settings)
-  - Real-time VPN traffic monitoring with charts
+  - Real-time VPN traffic monitoring with charts for both protocols
   - Secure password storage using system keyring
   - Connection status tracking
+  - Built-in VPN config import tools
 Homepage: https://github.com/vpnrdp/vpnrdp
 EOF
 
@@ -220,6 +223,15 @@ setup_openvpn3_repo() {
 # Main post-installation tasks
 case "$1" in
     configure)
+        # Check and install VPN clients
+        # Install WireGuard if not present
+        if ! command -v wg >/dev/null 2>&1 || ! command -v wg-quick >/dev/null 2>&1; then
+            echo "Installing WireGuard..."
+            apt-get install -y wireguard || echo "Note: WireGuard installation failed. You may need to install it manually."
+        else
+            echo "WireGuard is already installed."
+        fi
+        
         # Only setup OpenVPN3 repo if openvpn3 is not installed
         if ! command -v openvpn3 >/dev/null 2>&1; then
             setup_openvpn3_repo
@@ -241,16 +253,29 @@ case "$1" in
         echo "You can launch it from your application menu"
         echo "or by running 'vpnrdp' in a terminal."
         echo ""
+        
+        # Check what VPN clients are available
+        if ! command -v wg >/dev/null 2>&1 || ! command -v wg-quick >/dev/null 2>&1; then
+            echo "NOTE: WireGuard is not installed. To install it manually, run:"
+            echo "  sudo apt update && sudo apt install wireguard"
+            echo ""
+        fi
+        
         if ! command -v openvpn3 >/dev/null 2>&1; then
             echo "NOTE: OpenVPN3 is not installed. To install it manually, run:"
             echo "  sudo apt update && sudo apt install openvpn3"
             echo ""
         fi
+        
         echo "Before using VPN+RDP Manager:"
         echo "1. Import your VPN configurations:"
-        echo "   openvpn3 config-import --config /path/to/your/config.ovpn"
+        echo "   For OpenVPN3:"
+        echo "     openvpn3 config-import --config /path/to/your/config.ovpn"
+        echo "   For WireGuard:"
+        echo "     Copy your .conf files to ~/.config/wireguard/ or /etc/wireguard/"
         echo ""
         echo "2. Launch VPN+RDP Manager and create connection profiles"
+        echo "   - Choose between OpenVPN3 and WireGuard for each connection"
         echo ""
         ;;
     

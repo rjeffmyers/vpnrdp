@@ -66,7 +66,16 @@ apt-get install -y \
 echo -e "${YELLOW}Installing FreeRDP...${NC}"
 apt-get install -y freerdp2-x11 || apt-get install -y freerdp3-x11 || apt-get install -y freerdp-x11
 
-# Step 3: Setup OpenVPN3 repository
+# Step 3: Install VPN clients
+echo -e "${YELLOW}Installing VPN clients...${NC}"
+
+# Install WireGuard (usually available in standard repos)
+echo "Installing WireGuard..."
+apt-get install -y wireguard || {
+    echo -e "${YELLOW}WireGuard installation failed or not available${NC}"
+}
+
+# Setup OpenVPN3 repository
 echo -e "${YELLOW}Setting up OpenVPN3 repository...${NC}"
 
 DIST_CODENAME=$(get_ubuntu_codename)
@@ -82,8 +91,8 @@ echo "Downloading OpenVPN repository key..."
 curl -fsSL https://packages.openvpn.net/packages-repo.gpg -o /etc/apt/keyrings/openvpn.asc 2>/dev/null || \
 curl -fsSL https://swupdate.openvpn.net/repos/openvpn-repo-pkg-key.pub -o /etc/apt/keyrings/openvpn.asc 2>/dev/null || \
 {
-    echo -e "${RED}Warning: Could not download OpenVPN repository key${NC}"
-    echo "You may need to install OpenVPN3 manually later"
+    echo -e "${YELLOW}Warning: Could not download OpenVPN repository key${NC}"
+    echo "OpenVPN3 may need to be installed manually later"
 }
 
 # Add OpenVPN3 repository
@@ -96,11 +105,11 @@ if [ -f /etc/apt/keyrings/openvpn.asc ]; then
     # Install OpenVPN3
     echo -e "${YELLOW}Installing OpenVPN3...${NC}"
     apt-get install -y openvpn3 || {
-        echo -e "${RED}OpenVPN3 installation failed${NC}"
-        echo "You may need to install it manually"
+        echo -e "${YELLOW}OpenVPN3 installation failed${NC}"
+        echo "OpenVPN3 may need to be installed manually"
     }
 else
-    echo -e "${RED}Could not setup OpenVPN3 repository${NC}"
+    echo -e "${YELLOW}Could not setup OpenVPN3 repository${NC}"
 fi
 
 # Step 4: Install VPN+RDP Manager
@@ -151,11 +160,18 @@ echo -e "${GREEN}========================================${NC}"
 echo ""
 
 # Check what was installed
+if command -v wg >/dev/null 2>&1 && command -v wg-quick >/dev/null 2>&1; then
+    echo -e "${GREEN}✓${NC} WireGuard is installed"
+else
+    echo -e "${YELLOW}⚠${NC} WireGuard is not installed. To install manually:"
+    echo "    sudo apt update && sudo apt install wireguard"
+fi
+
 if command -v openvpn3 >/dev/null 2>&1; then
     echo -e "${GREEN}✓${NC} OpenVPN3 is installed"
 else
     echo -e "${YELLOW}⚠${NC} OpenVPN3 is not installed. To install manually:"
-    echo "    sudo apt update && sudo apt install openvpn3"
+    echo "    Follow instructions at: https://openvpn.net/cloud-docs/openvpn-3-client-for-linux/"
 fi
 
 if command -v xfreerdp >/dev/null 2>&1 || command -v xfreerdp3 >/dev/null 2>&1; then
@@ -173,11 +189,15 @@ fi
 echo ""
 echo "Next steps:"
 echo "1. Import your VPN configurations:"
-echo "   openvpn3 config-import --config /path/to/your/config.ovpn"
+echo "   For OpenVPN3:"
+echo "     openvpn3 config-import --config /path/to/your/config.ovpn"
+echo "   For WireGuard:"
+echo "     Copy your .conf files to ~/.config/wireguard/ or /etc/wireguard/"
 echo ""
 echo "2. Launch VPN+RDP Manager:"
 echo "   - From your application menu, or"
 echo "   - Run 'vpnrdp' in a terminal"
 echo ""
 echo "3. Create connection profiles for your VPN+RDP combinations"
+echo "   - Choose between OpenVPN3 and WireGuard for each connection"
 echo ""

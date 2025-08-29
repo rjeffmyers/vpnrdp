@@ -86,11 +86,46 @@ class VPNRDPManager(Gtk.Window):
         separator.set_draw(False)
         toolbar.insert(separator, 3)
         
+        # Tools button
+        tools_button = Gtk.ToolButton()
+        tools_button.set_label("Tools")
+        tools_button.set_icon_name("applications-system")
+        tools_button.set_tooltip_text("Installation helpers and utilities")
+        toolbar.insert(tools_button, 4)
+        
+        # Create tools menu
+        tools_menu = Gtk.Menu()
+        
+        # Install WireGuard menu item
+        wg_item = Gtk.MenuItem(label="Install WireGuard...")
+        wg_item.connect("activate", self.show_wireguard_install)
+        tools_menu.append(wg_item)
+        
+        # Install OpenVPN3 menu item
+        ovpn_item = Gtk.MenuItem(label="Install OpenVPN3...")
+        ovpn_item.connect("activate", self.show_openvpn3_install)
+        tools_menu.append(ovpn_item)
+        
+        # Separator
+        tools_menu.append(Gtk.SeparatorMenuItem())
+        
+        # Import WireGuard config
+        import_wg_item = Gtk.MenuItem(label="Import WireGuard Config...")
+        import_wg_item.connect("activate", self.import_wireguard_config)
+        tools_menu.append(import_wg_item)
+        
+        # Connect tools button to show menu
+        def show_tools_menu(widget):
+            tools_menu.show_all()
+            tools_menu.popup_at_widget(widget, Gdk.Gravity.SOUTH_WEST, Gdk.Gravity.NORTH_WEST, None)
+        
+        tools_button.connect("clicked", show_tools_menu)
+        
         # Help button
         help_button = Gtk.ToolButton()
         help_button.set_label("Help")
         help_button.set_icon_name("help-about")
-        toolbar.insert(help_button, 4)
+        toolbar.insert(help_button, 5)
         help_button.connect("clicked", self.show_about)
         
         # Title
@@ -115,7 +150,7 @@ class VPNRDPManager(Gtk.Window):
         conn_frame.add(scrolled)
         
         # List store for connections
-        self.liststore = Gtk.ListStore(str, str, str, str, str)  # Name, VPN Config, RDP Host, Username, Status
+        self.liststore = Gtk.ListStore(str, str, str, str, str, str)  # Name, Type, VPN Config, RDP Host, Username, Status
         
         # Tree view
         self.treeview = Gtk.TreeView(model=self.liststore)
@@ -128,21 +163,25 @@ class VPNRDPManager(Gtk.Window):
         column.set_min_width(150)
         self.treeview.append_column(column)
         
-        column = Gtk.TreeViewColumn("VPN Config", renderer, text=1)
+        column = Gtk.TreeViewColumn("Type", renderer, text=1)
         column.set_resizable(True)
         self.treeview.append_column(column)
         
-        column = Gtk.TreeViewColumn("RDP Host", renderer, text=2)
+        column = Gtk.TreeViewColumn("VPN Config", renderer, text=2)
         column.set_resizable(True)
         self.treeview.append_column(column)
         
-        column = Gtk.TreeViewColumn("RDP User", renderer, text=3)
+        column = Gtk.TreeViewColumn("RDP Host", renderer, text=3)
+        column.set_resizable(True)
+        self.treeview.append_column(column)
+        
+        column = Gtk.TreeViewColumn("RDP User", renderer, text=4)
         column.set_resizable(True)
         self.treeview.append_column(column)
         
         # Status column with color
         status_renderer = Gtk.CellRendererText()
-        column = Gtk.TreeViewColumn("Status", status_renderer, text=4)
+        column = Gtk.TreeViewColumn("Status", status_renderer, text=5)
         column.set_cell_data_func(status_renderer, self.status_cell_data_func)
         self.treeview.append_column(column)
         
@@ -262,7 +301,7 @@ class VPNRDPManager(Gtk.Window):
     
     def status_cell_data_func(self, column, cell, model, iter, data):
         """Color code the status column"""
-        status = model.get_value(iter, 4)
+        status = model.get_value(iter, 5)
         if status == "Connected":
             cell.set_property("foreground", "green")
         elif status == "Connecting...":
@@ -275,9 +314,22 @@ class VPNRDPManager(Gtk.Window):
     def check_dependencies(self):
         """Check if required programs are installed"""
         missing = []
+        optional_missing = []
         
-        if not shutil.which("openvpn3"):
-            missing.append("OpenVPN3")
+        # Check for at least one VPN solution
+        has_vpn = False
+        if shutil.which("openvpn3"):
+            has_vpn = True
+        else:
+            optional_missing.append("OpenVPN3")
+            
+        if shutil.which("wg") and shutil.which("wg-quick"):
+            has_vpn = True
+        else:
+            optional_missing.append("WireGuard")
+        
+        if not has_vpn:
+            missing.append("VPN client (OpenVPN3 or WireGuard)")
         
         if not shutil.which("xfreerdp") and not shutil.which("xfreerdp3"):
             missing.append("FreeRDP")
@@ -288,16 +340,20 @@ class VPNRDPManager(Gtk.Window):
                 flags=0,
                 message_type=Gtk.MessageType.WARNING,
                 buttons=Gtk.ButtonsType.OK,
-                text="Missing Dependencies"
+                text="Missing Required Dependencies"
             )
             dialog.format_secondary_text(
-                f"The following programs are not installed:\n{', '.join(missing)}\n\n"
-                "Please install them for full functionality:\n"
+                f"The following required programs are not installed:\n{', '.join(missing)}\n\n"
+                "Please install at least one VPN client:\n"
                 "• OpenVPN3: sudo apt install openvpn3\n"
+                "• WireGuard: sudo apt install wireguard\n"
                 "• FreeRDP: sudo apt install freerdp2-x11"
             )
             dialog.run()
             dialog.destroy()
+        elif optional_missing:
+            # Show optional dependencies info in status bar
+            self.update_status(f"Optional: {', '.join(optional_missing)} not installed")
     
     def load_connections(self):
         """Load saved connections from file"""
@@ -321,11 +377,25 @@ class VPNRDPManager(Gtk.Window):
         self.liststore.clear()
         for name, conn in self.connections.items():
             status = self.active_connections.get(name, {}).get("status", "Disconnected")
+            conn_type = conn.get("connection_mode", "VPN+RDP")  # Default to VPN+RDP for existing connections
+            
+            # Format display values based on connection type
+            vpn_config = ""
+            rdp_host = ""
+            rdp_username = ""
+            
+            if conn_type in ["VPN+RDP", "VPN Only"]:
+                vpn_config = os.path.basename(conn.get("vpn_config", ""))
+            if conn_type in ["VPN+RDP", "RDP Only"]:
+                rdp_host = conn.get("rdp_host", "")
+                rdp_username = conn.get("rdp_username", "")
+            
             self.liststore.append([
                 name,
-                os.path.basename(conn.get("vpn_config", "")),
-                conn.get("rdp_host", ""),
-                conn.get("rdp_username", ""),
+                conn_type,
+                vpn_config,
+                rdp_host,
+                rdp_username,
                 status
             ])
     
@@ -479,7 +549,15 @@ class VPNRDPManager(Gtk.Window):
         details_text.set_editable(False)
         details_text.set_wrap_mode(Gtk.WrapMode.WORD)
         details_buffer = details_text.get_buffer()
-        details_buffer.set_text(f"VPN Config: {conn.get('vpn_config', 'N/A')}\nRDP Host: {conn.get('rdp_host', 'N/A')}")
+        
+        # Build details based on connection mode
+        connection_mode = conn.get("connection_mode", "VPN+RDP")
+        details = f"Connection Type: {connection_mode}\n"
+        if connection_mode in ["VPN+RDP", "VPN Only"]:
+            details += f"VPN Config: {conn.get('vpn_config', 'N/A')}\n"
+        if connection_mode in ["VPN+RDP", "RDP Only"]:
+            details += f"RDP Host: {conn.get('rdp_host', 'N/A')}"
+        details_buffer.set_text(details)
         
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_min_content_height(100)
@@ -520,60 +598,120 @@ class VPNRDPManager(Gtk.Window):
     def connection_worker_with_dialog(self, name, conn, dialog):
         """Worker thread for establishing connection with dialog updates"""
         try:
-            # Update dialog: Connecting to VPN
-            GLib.idle_add(self.connecting_status_label.set_text, "Establishing VPN connection...")
-            GLib.idle_add(self.connecting_progress.set_fraction, 0.25)
+            connection_mode = conn.get("connection_mode", "VPN+RDP")
             
-            if self.connecting_canceled:
+            # Handle VPN-only connections
+            if connection_mode == "VPN Only":
+                GLib.idle_add(self.connecting_status_label.set_text, "Establishing VPN connection...")
+                GLib.idle_add(self.connecting_progress.set_fraction, 0.5)
+                
+                if self.connecting_canceled:
+                    return
+                
+                # Connect to VPN
+                vpn_success = self.connect_vpn(name, conn)
+                
+                if vpn_success:
+                    GLib.idle_add(self.connecting_status_label.set_text, "VPN connection established successfully!")
+                    GLib.idle_add(self.connecting_progress.set_fraction, 1.0)
+                    GLib.idle_add(self.update_connection_status, name, "VPN Connected")
+                    GLib.idle_add(self.update_status, f"VPN connected: {name}")
+                    GLib.idle_add(self.update_buttons, True)
+                    time.sleep(1)
+                    GLib.idle_add(dialog.response, Gtk.ResponseType.OK)
+                else:
+                    GLib.idle_add(self.connecting_status_label.set_text, "VPN connection failed!")
+                    GLib.idle_add(self.update_connection_status, name, "VPN Failed")
+                    GLib.idle_add(self.update_status, f"VPN connection failed for {name}")
+                    GLib.idle_add(self.update_buttons, False)
+                    time.sleep(2)
+                    GLib.idle_add(dialog.response, Gtk.ResponseType.CLOSE)
                 return
             
-            # Connect to VPN
-            vpn_success = self.connect_vpn(name, conn)
-            
-            if not vpn_success:
-                GLib.idle_add(self.connecting_status_label.set_text, "VPN connection failed!")
-                GLib.idle_add(self.update_connection_status, name, "VPN Failed")
-                GLib.idle_add(self.update_status, f"VPN connection failed for {name}")
-                GLib.idle_add(self.update_buttons, False)
-                time.sleep(2)  # Show error briefly
-                GLib.idle_add(dialog.response, Gtk.ResponseType.CLOSE)
+            # Handle RDP-only connections
+            elif connection_mode == "RDP Only":
+                GLib.idle_add(self.connecting_status_label.set_text, "Establishing RDP connection...")
+                GLib.idle_add(self.connecting_progress.set_fraction, 0.5)
+                
+                if self.connecting_canceled:
+                    return
+                
+                # Connect to RDP directly
+                rdp_success = self.connect_rdp(name, conn)
+                
+                if rdp_success:
+                    GLib.idle_add(self.connecting_status_label.set_text, "RDP connection established successfully!")
+                    GLib.idle_add(self.connecting_progress.set_fraction, 1.0)
+                    GLib.idle_add(self.update_connection_status, name, "RDP Connected")
+                    GLib.idle_add(self.update_status, f"RDP connected: {name}")
+                    GLib.idle_add(self.update_buttons, True)
+                    time.sleep(1)
+                    GLib.idle_add(dialog.response, Gtk.ResponseType.OK)
+                else:
+                    GLib.idle_add(self.connecting_status_label.set_text, "RDP connection failed!")
+                    GLib.idle_add(self.update_connection_status, name, "RDP Failed")
+                    GLib.idle_add(self.update_status, f"RDP connection failed for {name}")
+                    GLib.idle_add(self.update_buttons, False)
+                    time.sleep(2)
+                    GLib.idle_add(dialog.response, Gtk.ResponseType.CLOSE)
                 return
             
-            if self.connecting_canceled:
-                self.disconnect_vpn(name)
-                return
-            
-            # Update dialog: VPN connected, connecting to RDP
-            GLib.idle_add(self.connecting_status_label.set_text, "VPN connected! Establishing RDP connection...")
-            GLib.idle_add(self.connecting_progress.set_fraction, 0.75)
-            
-            # Wait for VPN to stabilize
-            time.sleep(3)
-            
-            if self.connecting_canceled:
-                self.disconnect_vpn(name)
-                return
-            
-            # Connect to RDP
-            rdp_success = self.connect_rdp(name, conn)
-            
-            if rdp_success:
-                GLib.idle_add(self.connecting_status_label.set_text, "Connection established successfully!")
-                GLib.idle_add(self.connecting_progress.set_fraction, 1.0)
-                GLib.idle_add(self.update_connection_status, name, "Connected")
-                GLib.idle_add(self.update_status, f"Connected to {name}")
-                GLib.idle_add(self.update_buttons, True)
-                time.sleep(1)  # Show success briefly
-                GLib.idle_add(dialog.response, Gtk.ResponseType.OK)
+            # Handle VPN+RDP connections (default)
             else:
-                # RDP failed, disconnect VPN
-                GLib.idle_add(self.connecting_status_label.set_text, "RDP connection failed!")
-                self.disconnect_vpn(name)
-                GLib.idle_add(self.update_connection_status, name, "RDP Failed")
-                GLib.idle_add(self.update_status, f"RDP connection failed for {name}")
-                GLib.idle_add(self.update_buttons, False)
-                time.sleep(2)  # Show error briefly
-                GLib.idle_add(dialog.response, Gtk.ResponseType.CLOSE)
+                # Update dialog: Connecting to VPN
+                GLib.idle_add(self.connecting_status_label.set_text, "Establishing VPN connection...")
+                GLib.idle_add(self.connecting_progress.set_fraction, 0.25)
+                
+                if self.connecting_canceled:
+                    return
+                
+                # Connect to VPN
+                vpn_success = self.connect_vpn(name, conn)
+                
+                if not vpn_success:
+                    GLib.idle_add(self.connecting_status_label.set_text, "VPN connection failed!")
+                    GLib.idle_add(self.update_connection_status, name, "VPN Failed")
+                    GLib.idle_add(self.update_status, f"VPN connection failed for {name}")
+                    GLib.idle_add(self.update_buttons, False)
+                    time.sleep(2)  # Show error briefly
+                    GLib.idle_add(dialog.response, Gtk.ResponseType.CLOSE)
+                    return
+                
+                if self.connecting_canceled:
+                    self.disconnect_vpn(name)
+                    return
+                
+                # Update dialog: VPN connected, connecting to RDP
+                GLib.idle_add(self.connecting_status_label.set_text, "VPN connected! Establishing RDP connection...")
+                GLib.idle_add(self.connecting_progress.set_fraction, 0.75)
+                
+                # Wait for VPN to stabilize
+                time.sleep(3)
+                
+                if self.connecting_canceled:
+                    self.disconnect_vpn(name)
+                    return
+                
+                # Connect to RDP
+                rdp_success = self.connect_rdp(name, conn)
+                
+                if rdp_success:
+                    GLib.idle_add(self.connecting_status_label.set_text, "Connection established successfully!")
+                    GLib.idle_add(self.connecting_progress.set_fraction, 1.0)
+                    GLib.idle_add(self.update_connection_status, name, "Connected")
+                    GLib.idle_add(self.update_status, f"Connected to {name}")
+                    GLib.idle_add(self.update_buttons, True)
+                    time.sleep(1)  # Show success briefly
+                    GLib.idle_add(dialog.response, Gtk.ResponseType.OK)
+                else:
+                    # RDP failed, disconnect VPN
+                    GLib.idle_add(self.connecting_status_label.set_text, "RDP connection failed!")
+                    self.disconnect_vpn(name)
+                    GLib.idle_add(self.update_connection_status, name, "RDP Failed")
+                    GLib.idle_add(self.update_status, f"RDP connection failed for {name}")
+                    GLib.idle_add(self.update_buttons, False)
+                    time.sleep(2)  # Show error briefly
+                    GLib.idle_add(dialog.response, Gtk.ResponseType.CLOSE)
         
         except Exception as e:
             GLib.idle_add(self.connecting_status_label.set_text, f"Error: {str(e)}")
@@ -618,6 +756,21 @@ class VPNRDPManager(Gtk.Window):
     
     def connect_vpn(self, name, conn):
         """Connect to VPN"""
+        vpn_type = conn.get("vpn_type", "OpenVPN3")
+        vpn_config = conn.get("vpn_config")
+        
+        if not vpn_config:
+            return False
+        
+        if vpn_type == "OpenVPN3":
+            return self.connect_openvpn3(name, conn)
+        elif vpn_type == "WireGuard":
+            return self.connect_wireguard(name, conn)
+        else:
+            return False
+    
+    def connect_openvpn3(self, name, conn):
+        """Connect using OpenVPN3"""
         vpn_config = conn.get("vpn_config")
         vpn_username = conn.get("vpn_username")
         vpn_password = self.get_password(name, "vpn")
@@ -649,6 +802,7 @@ class VPNRDPManager(Gtk.Window):
                     if 'Session path:' in line:
                         session_path = line.split('Session path:')[1].strip()
                         self.active_connections[name] = {
+                            "vpn_type": "OpenVPN3",
                             "vpn_session": session_path,
                             "status": "VPN Connected"
                         }
@@ -656,10 +810,10 @@ class VPNRDPManager(Gtk.Window):
                 
                 # Try alternative format
                 if '/net/openvpn/v3/sessions/' in stdout:
-                    import re
                     matches = re.findall(r'/net/openvpn/v3/sessions/[a-f0-9s]+', stdout)
                     if matches:
                         self.active_connections[name] = {
+                            "vpn_type": "OpenVPN3",
                             "vpn_session": matches[0],
                             "status": "VPN Connected"
                         }
@@ -668,7 +822,63 @@ class VPNRDPManager(Gtk.Window):
             return False
         
         except Exception as e:
-            print(f"VPN connection error: {e}")
+            print(f"OpenVPN3 connection error: {e}")
+            return False
+    
+    def connect_wireguard(self, name, conn):
+        """Connect using WireGuard"""
+        vpn_config = conn.get("vpn_config")
+        
+        if not vpn_config:
+            return False
+        
+        # Handle sudo prefix for system configs
+        needs_sudo = vpn_config.startswith("sudo:")
+        if needs_sudo:
+            vpn_config = vpn_config[5:]  # Remove "sudo:" prefix
+        
+        if not os.path.exists(vpn_config):
+            print(f"WireGuard config not found: {vpn_config}")
+            return False
+        
+        try:
+            # Extract interface name from config file name
+            config_name = os.path.basename(vpn_config)
+            if config_name.endswith('.conf'):
+                interface_name = config_name[:-5]  # Remove .conf extension
+            else:
+                interface_name = "wg0"
+            
+            # Start WireGuard connection
+            if needs_sudo or not os.access(vpn_config, os.R_OK):
+                # Need sudo for system configs
+                cmd = ["sudo", "wg-quick", "up", vpn_config]
+            else:
+                cmd = ["wg-quick", "up", vpn_config]
+            
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            
+            if result.returncode == 0 or "already exists" in result.stderr:
+                # Connection successful or already connected
+                self.active_connections[name] = {
+                    "vpn_type": "WireGuard",
+                    "vpn_interface": interface_name,
+                    "vpn_config": vpn_config,
+                    "needs_sudo": needs_sudo,
+                    "status": "VPN Connected"
+                }
+                return True
+            
+            print(f"WireGuard connection failed: {result.stderr}")
+            return False
+        
+        except Exception as e:
+            print(f"WireGuard connection error: {e}")
             return False
     
     def connect_rdp(self, name, conn):
@@ -808,20 +1018,26 @@ class VPNRDPManager(Gtk.Window):
         
         self.update_status(f"Disconnecting {name}...")
         
-        # Disconnect RDP first
-        if "rdp_process" in self.active_connections[name]:
-            try:
-                proc = self.active_connections[name]["rdp_process"]
-                proc.terminate()
-                proc.wait(timeout=5)
-            except:
-                try:
-                    proc.kill()
-                except:
-                    pass
+        # Get connection mode
+        conn = self.connections.get(name, {})
+        connection_mode = conn.get("connection_mode", "VPN+RDP")
         
-        # Then disconnect VPN
-        self.disconnect_vpn(name)
+        # Disconnect RDP if applicable
+        if connection_mode in ["VPN+RDP", "RDP Only"]:
+            if "rdp_process" in self.active_connections[name]:
+                try:
+                    proc = self.active_connections[name]["rdp_process"]
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except:
+                    try:
+                        proc.kill()
+                    except:
+                        pass
+        
+        # Disconnect VPN if applicable
+        if connection_mode in ["VPN+RDP", "VPN Only"]:
+            self.disconnect_vpn(name)
         
         # Clean up
         if name in self.active_connections:
@@ -834,16 +1050,35 @@ class VPNRDPManager(Gtk.Window):
     def disconnect_vpn(self, name):
         """Disconnect VPN session"""
         if name in self.active_connections:
-            session = self.active_connections[name].get("vpn_session")
-            if session:
-                try:
-                    subprocess.run(
-                        ["openvpn3", "session-manage", "--session-path", session, "--disconnect"],
-                        capture_output=True,
-                        timeout=5
-                    )
-                except:
-                    pass
+            conn_info = self.active_connections[name]
+            vpn_type = conn_info.get("vpn_type", "OpenVPN3")
+            
+            if vpn_type == "OpenVPN3":
+                session = conn_info.get("vpn_session")
+                if session:
+                    try:
+                        subprocess.run(
+                            ["openvpn3", "session-manage", "--session-path", session, "--disconnect"],
+                            capture_output=True,
+                            timeout=5
+                        )
+                    except:
+                        pass
+            
+            elif vpn_type == "WireGuard":
+                vpn_config = conn_info.get("vpn_config")
+                needs_sudo = conn_info.get("needs_sudo", False)
+                
+                if vpn_config:
+                    try:
+                        if needs_sudo:
+                            cmd = ["sudo", "wg-quick", "down", vpn_config]
+                        else:
+                            cmd = ["wg-quick", "down", vpn_config]
+                        
+                        subprocess.run(cmd, capture_output=True, timeout=5)
+                    except:
+                        pass
     
     def monitor_connections(self):
         """Monitor active connections"""
@@ -1075,9 +1310,9 @@ class VPNRDPManager(Gtk.Window):
             
             if active_connection:
                 # Get VPN statistics
-                vpn_session = self.active_connections[active_connection].get("vpn_session")
-                if vpn_session:
-                    self.get_vpn_stats(active_connection, vpn_session)
+                conn_info = self.active_connections[active_connection]
+                if conn_info.get("vpn_type") == "WireGuard" or conn_info.get("vpn_session"):
+                    self.get_vpn_stats(active_connection, conn_info)
             else:
                 # No active connection - add zero data points
                 self.bytes_in_history.append(0)
@@ -1089,43 +1324,95 @@ class VPNRDPManager(Gtk.Window):
         
         return True  # Continue monitoring
     
-    def get_vpn_stats(self, connection_name, session_path):
+    def get_vpn_stats(self, connection_name, session_info):
         """Get VPN statistics for a session"""
-        try:
-            result = subprocess.run(
-                ["openvpn3", "session-stats", "--session-path", session_path],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
+        if not isinstance(session_info, dict):
+            # Legacy support for direct session path
+            session_info = {"vpn_type": "OpenVPN3", "vpn_session": session_info}
+        
+        vpn_type = session_info.get("vpn_type", "OpenVPN3")
+        
+        if vpn_type == "OpenVPN3":
+            session_path = session_info.get("vpn_session")
+            if not session_path:
+                return
             
-            if result.returncode == 0:
-                bytes_in_value = 0
-                bytes_out_value = 0
+            try:
+                result = subprocess.run(
+                    ["openvpn3", "session-stats", "--session-path", session_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
                 
-                # Parse statistics
-                for line in result.stdout.split('\n'):
-                    # Look for BYTES_IN but not TUN_BYTES_IN
-                    if 'BYTES_IN' in line and not line.strip().startswith('TUN_'):
-                        try:
-                            if '.' in line:
-                                value_str = line.split('.')[-1].strip()
-                                bytes_in_value = int(value_str)
-                        except:
-                            pass
-                    # Look for BYTES_OUT but not TUN_BYTES_OUT
-                    elif 'BYTES_OUT' in line and not line.strip().startswith('TUN_'):
-                        try:
-                            if '.' in line:
-                                value_str = line.split('.')[-1].strip()
-                                bytes_out_value = int(value_str)
-                        except:
-                            pass
+                if result.returncode == 0:
+                    bytes_in_value = 0
+                    bytes_out_value = 0
+                    
+                    # Parse statistics
+                    for line in result.stdout.split('\n'):
+                        # Look for BYTES_IN but not TUN_BYTES_IN
+                        if 'BYTES_IN' in line and not line.strip().startswith('TUN_'):
+                            try:
+                                if '.' in line:
+                                    value_str = line.split('.')[-1].strip()
+                                    bytes_in_value = int(value_str)
+                            except:
+                                pass
+                        # Look for BYTES_OUT but not TUN_BYTES_OUT
+                        elif 'BYTES_OUT' in line and not line.strip().startswith('TUN_'):
+                            try:
+                                if '.' in line:
+                                    value_str = line.split('.')[-1].strip()
+                                    bytes_out_value = int(value_str)
+                            except:
+                                pass
+                    
+                    # Update chart data
+                    self.update_chart_data(connection_name, bytes_in_value, bytes_out_value)
+            except Exception as e:
+                print(f"Error getting OpenVPN3 stats: {e}")
+        
+        elif vpn_type == "WireGuard":
+            interface_name = session_info.get("vpn_interface", "wg0")
+            needs_sudo = session_info.get("needs_sudo", False)
+            
+            try:
+                # Get WireGuard statistics
+                if needs_sudo:
+                    cmd = ["sudo", "wg", "show", interface_name, "transfer"]
+                else:
+                    cmd = ["wg", "show", interface_name, "transfer"]
                 
-                # Update chart data
-                self.update_chart_data(connection_name, bytes_in_value, bytes_out_value)
-        except Exception as e:
-            print(f"Error getting VPN stats: {e}")
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                
+                if result.returncode == 0:
+                    bytes_in_value = 0
+                    bytes_out_value = 0
+                    
+                    # Parse WireGuard output format:
+                    # peer_key<tab>received_bytes<tab>sent_bytes
+                    for line in result.stdout.strip().split('\n'):
+                        if line:
+                            parts = line.split('\t')
+                            if len(parts) >= 3:
+                                try:
+                                    # WireGuard shows received and sent per peer
+                                    # We sum all peers for total traffic
+                                    bytes_in_value += int(parts[1])
+                                    bytes_out_value += int(parts[2])
+                                except:
+                                    pass
+                    
+                    # Update chart data
+                    self.update_chart_data(connection_name, bytes_in_value, bytes_out_value)
+            except Exception as e:
+                print(f"Error getting WireGuard stats: {e}")
     
     def update_chart_data(self, connection_name, bytes_in, bytes_out):
         """Update chart with new traffic data"""
@@ -1210,6 +1497,166 @@ class VPNRDPManager(Gtk.Window):
                         self.chart_connection_combo.set_active(i)
                         break
     
+    def show_wireguard_install(self, widget):
+        """Show WireGuard installation dialog"""
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            flags=0,
+            message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text="Install WireGuard"
+        )
+        dialog.format_secondary_text(
+            "WireGuard is a modern, fast VPN protocol.\n\n"
+            "To install WireGuard, run:\n"
+            "sudo apt update && sudo apt install wireguard\n\n"
+            "Click OK to copy the command to clipboard."
+        )
+        
+        response = dialog.run()
+        dialog.destroy()
+        
+        if response == Gtk.ResponseType.OK:
+            clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            clipboard.set_text("sudo apt update && sudo apt install wireguard", -1)
+            self.update_status("WireGuard install command copied to clipboard")
+    
+    def show_openvpn3_install(self, widget):
+        """Show OpenVPN3 installation dialog"""
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            flags=0,
+            message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text="Install OpenVPN3"
+        )
+        dialog.format_secondary_text(
+            "OpenVPN3 requires adding a repository.\n\n"
+            "To install OpenVPN3:\n"
+            "1. Add the OpenVPN repository\n"
+            "2. Run: sudo apt update && sudo apt install openvpn3\n\n"
+            "For detailed instructions, visit:\n"
+            "https://openvpn.net/cloud-docs/openvpn-3-client-for-linux/\n\n"
+            "Click OK to copy the basic command to clipboard."
+        )
+        
+        response = dialog.run()
+        dialog.destroy()
+        
+        if response == Gtk.ResponseType.OK:
+            clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            clipboard.set_text("sudo apt update && sudo apt install openvpn3", -1)
+            self.update_status("OpenVPN3 install command copied to clipboard")
+    
+    def import_wireguard_config(self, widget):
+        """Import WireGuard configuration file"""
+        dialog = Gtk.FileChooserDialog(
+            title="Import WireGuard Configuration",
+            parent=self,
+            action=Gtk.FileChooserAction.OPEN
+        )
+        dialog.add_buttons(
+            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+            "Import", Gtk.ResponseType.OK
+        )
+        
+        # Add file filters
+        filter_conf = Gtk.FileFilter()
+        filter_conf.set_name("WireGuard configs (*.conf)")
+        filter_conf.add_pattern("*.conf")
+        dialog.add_filter(filter_conf)
+        
+        filter_all = Gtk.FileFilter()
+        filter_all.set_name("All files")
+        filter_all.add_pattern("*")
+        dialog.add_filter(filter_all)
+        
+        response = dialog.run()
+        
+        if response == Gtk.ResponseType.OK:
+            source_file = dialog.get_filename()
+            filename = os.path.basename(source_file)
+            
+            # Ask where to save it
+            location_dialog = Gtk.MessageDialog(
+                transient_for=self,
+                flags=0,
+                message_type=Gtk.MessageType.QUESTION,
+                buttons=Gtk.ButtonsType.NONE,
+                text="Where to save WireGuard config?"
+            )
+            location_dialog.format_secondary_text(
+                f"Config file: {filename}\n\n"
+                "Choose location:"
+            )
+            
+            location_dialog.add_button("User Directory\n(~/.config/wireguard)", 1)
+            location_dialog.add_button("System Directory\n(/etc/wireguard - requires sudo)", 2)
+            location_dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+            
+            location_response = location_dialog.run()
+            location_dialog.destroy()
+            
+            if location_response == 1:
+                # User directory
+                dest_dir = os.path.expanduser("~/.config/wireguard")
+                os.makedirs(dest_dir, exist_ok=True)
+                dest_file = os.path.join(dest_dir, filename)
+                
+                try:
+                    shutil.copy2(source_file, dest_file)
+                    os.chmod(dest_file, 0o600)  # Secure permissions
+                    self.show_info(f"WireGuard config imported to:\n{dest_file}")
+                except Exception as e:
+                    self.show_error(f"Failed to import config: {str(e)}")
+            
+            elif location_response == 2:
+                # System directory (requires sudo)
+                dest_file = f"/etc/wireguard/{filename}"
+                
+                try:
+                    # Use sudo to copy
+                    result = subprocess.run(
+                        ["sudo", "cp", source_file, dest_file],
+                        capture_output=True,
+                        text=True
+                    )
+                    
+                    if result.returncode == 0:
+                        # Set permissions
+                        subprocess.run(["sudo", "chmod", "600", dest_file])
+                        self.show_info(f"WireGuard config imported to:\n{dest_file}")
+                    else:
+                        self.show_error(f"Failed to import config:\n{result.stderr}")
+                except Exception as e:
+                    self.show_error(f"Failed to import config: {str(e)}")
+        
+        dialog.destroy()
+    
+    def show_info(self, message):
+        """Show info dialog"""
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            flags=0,
+            message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK,
+            text=message
+        )
+        dialog.run()
+        dialog.destroy()
+    
+    def show_error(self, message):
+        """Show error dialog"""
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            flags=0,
+            message_type=Gtk.MessageType.ERROR,
+            buttons=Gtk.ButtonsType.OK,
+            text=message
+        )
+        dialog.run()
+        dialog.destroy()
+    
     def show_about(self, widget):
         """Show about dialog"""
         dialog = Gtk.AboutDialog()
@@ -1269,13 +1716,54 @@ class ConnectionDialog(Gtk.Dialog):
         self.name_entry.set_text(self.connection_data.get("name", ""))
         name_box.pack_start(self.name_entry, True, True, 0)
         
+        # Connection Mode selection
+        mode_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        vbox.pack_start(mode_box, False, False, 0)
+        
+        label = Gtk.Label(label="Connection Mode:")
+        label.set_size_request(150, -1)
+        label.set_xalign(0)
+        mode_box.pack_start(label, False, False, 0)
+        
+        self.connection_mode_combo = Gtk.ComboBoxText()
+        self.connection_mode_combo.append_text("VPN+RDP")
+        self.connection_mode_combo.append_text("VPN Only")
+        self.connection_mode_combo.append_text("RDP Only")
+        
+        # Set default or existing value
+        current_mode = self.connection_data.get("connection_mode", "VPN+RDP")
+        mode_index = {"VPN+RDP": 0, "VPN Only": 1, "RDP Only": 2}.get(current_mode, 0)
+        self.connection_mode_combo.set_active(mode_index)
+        
+        self.connection_mode_combo.connect("changed", self.on_connection_mode_changed)
+        mode_box.pack_start(self.connection_mode_combo, True, True, 0)
+        
         # VPN Settings Frame
-        vpn_frame = Gtk.Frame(label="VPN Settings")
-        vbox.pack_start(vpn_frame, False, False, 0)
+        self.vpn_frame = Gtk.Frame(label="VPN Settings")
+        vbox.pack_start(self.vpn_frame, False, False, 0)
         
         vpn_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
         vpn_box.set_border_width(10)
-        vpn_frame.add(vpn_box)
+        self.vpn_frame.add(vpn_box)
+        
+        # VPN Type selection
+        type_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        vpn_box.pack_start(type_box, False, False, 0)
+        
+        label = Gtk.Label(label="VPN Type:")
+        label.set_size_request(150, -1)
+        label.set_xalign(0)
+        type_box.pack_start(label, False, False, 0)
+        
+        self.vpn_type_combo = Gtk.ComboBoxText()
+        if shutil.which("openvpn3"):
+            self.vpn_type_combo.append_text("OpenVPN3")
+        if shutil.which("wg") and shutil.which("wg-quick"):
+            self.vpn_type_combo.append_text("WireGuard")
+        
+        type_box.pack_start(self.vpn_type_combo, True, True, 0)
+        
+        # Don't connect the signal yet - we'll do it after setting up everything
         
         # VPN Config file
         config_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -1286,30 +1774,43 @@ class ConnectionDialog(Gtk.Dialog):
         label.set_xalign(0)
         config_box.pack_start(label, False, False, 0)
         
-        self.vpn_config_combo = Gtk.ComboBoxText()
-        self.load_vpn_configs()
+        # Use ComboBoxText with entry for manual input
+        self.vpn_config_combo = Gtk.ComboBoxText.new_with_entry()
+        self.vpn_config_entry = self.vpn_config_combo.get_child()  # Get the entry widget
+        self.vpn_config_entry.set_placeholder_text("Select or enter config path")
         config_box.pack_start(self.vpn_config_combo, True, True, 0)
         
-        # VPN Username
-        username_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        vpn_box.pack_start(username_box, False, False, 0)
+        # Browse button for config file
+        self.browse_config_button = Gtk.Button(label="Browse...")
+        self.browse_config_button.connect("clicked", self.browse_vpn_config)
+        config_box.pack_start(self.browse_config_button, False, False, 0)
+        
+        # VPN Username (mainly for OpenVPN3)
+        self.username_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        vpn_box.pack_start(self.username_box, False, False, 0)
         
         label = Gtk.Label(label="VPN Username:")
         label.set_size_request(150, -1)
         label.set_xalign(0)
-        username_box.pack_start(label, False, False, 0)
+        self.username_box.pack_start(label, False, False, 0)
         
         self.vpn_username_entry = Gtk.Entry()
+        self.vpn_username_entry.set_placeholder_text("Required for OpenVPN3")
         self.vpn_username_entry.set_text(self.connection_data.get("vpn_username", ""))
-        username_box.pack_start(self.vpn_username_entry, True, True, 0)
+        self.username_box.pack_start(self.vpn_username_entry, True, True, 0)
+        
+        # Set initial sensitivity based on VPN type
+        current_vpn_type = self.connection_data.get("vpn_type", "")
+        if current_vpn_type == "WireGuard":
+            self.vpn_username_entry.set_sensitive(False)
         
         # RDP Settings Frame
-        rdp_frame = Gtk.Frame(label="RDP Settings")
-        vbox.pack_start(rdp_frame, False, False, 0)
+        self.rdp_frame = Gtk.Frame(label="RDP Settings")
+        vbox.pack_start(self.rdp_frame, False, False, 0)
         
         rdp_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
         rdp_box.set_border_width(10)
-        rdp_frame.add(rdp_box)
+        self.rdp_frame.add(rdp_box)
         
         # RDP Host
         host_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -1507,38 +2008,188 @@ class ConnectionDialog(Gtk.Dialog):
         # Add Advanced tab to notebook
         notebook.append_page(advanced_scrolled, Gtk.Label(label="Advanced"))
         
-        # Set current VPN config if editing
-        if connection_data and "vpn_config" in connection_data:
-            vpn_config = connection_data["vpn_config"]
-            # Find and set the matching config
-            model = self.vpn_config_combo.get_model()
-            for i, row in enumerate(model):
-                if row[0] == vpn_config:
-                    self.vpn_config_combo.set_active(i)
-                    break
+        # Initialize VPN type and configs if editing
+        if connection_data:
+            # Set VPN type first
+            current_vpn_type = connection_data.get("vpn_type", "")
+            if current_vpn_type:
+                # Try to find and set the current VPN type
+                model = self.vpn_type_combo.get_model()
+                for i in range(len(model)):
+                    if model[i][0] == current_vpn_type:
+                        self.vpn_type_combo.set_active(i)
+                        break
+                else:
+                    # If not found, set first available
+                    if len(model) > 0:
+                        self.vpn_type_combo.set_active(0)
+            else:
+                # No saved type, set first available
+                if self.vpn_type_combo.get_model():
+                    self.vpn_type_combo.set_active(0)
+            
+            # Load configs for the selected VPN type
+            self.load_vpn_configs()
+            
+            # Set current VPN config if editing
+            if "vpn_config" in connection_data:
+                vpn_config = connection_data["vpn_config"]
+                # Always set the text in the entry field
+                self.vpn_config_entry.set_text(vpn_config)
+                # Then try to find and set the matching config in the combo
+                model = self.vpn_config_combo.get_model()
+                for i, row in enumerate(model):
+                    if row[0] == vpn_config:
+                        self.vpn_config_combo.set_active(i)
+                        break
+        else:
+            # New connection - set defaults
+            if self.vpn_type_combo.get_model():
+                self.vpn_type_combo.set_active(0)
+            self.load_vpn_configs()
+        
+        # Now connect the change signal
+        self.vpn_type_combo.connect("changed", self.on_vpn_type_changed)
         
         self.show_all()
+        # Apply initial visibility based on connection mode
+        self.on_connection_mode_changed(None)
+    
+    def on_vpn_type_changed(self, widget):
+        """Handle VPN type selection change"""
+        self.load_vpn_configs()
+        
+        # Show/hide username field based on VPN type
+        vpn_type = self.vpn_type_combo.get_active_text()
+        if hasattr(self, 'vpn_username_entry'):
+            # WireGuard doesn't need username
+            self.vpn_username_entry.set_sensitive(vpn_type == "OpenVPN3")
+    
+    def on_connection_mode_changed(self, widget):
+        """Handle connection mode selection change"""
+        mode = self.connection_mode_combo.get_active_text()
+        
+        if not mode:
+            return
+        
+        # Show/hide frames based on mode
+        if mode == "VPN+RDP":
+            self.vpn_frame.show()
+            self.rdp_frame.show()
+        elif mode == "VPN Only":
+            self.vpn_frame.show()
+            self.rdp_frame.hide()
+        elif mode == "RDP Only":
+            self.vpn_frame.hide()
+            self.rdp_frame.show()
+    
+    def browse_vpn_config(self, widget):
+        """Browse for VPN configuration file"""
+        vpn_type = self.vpn_type_combo.get_active_text()
+        
+        dialog = Gtk.FileChooserDialog(
+            title=f"Select {vpn_type} Configuration",
+            parent=self.get_toplevel(),
+            action=Gtk.FileChooserAction.OPEN
+        )
+        dialog.add_buttons(
+            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+            Gtk.STOCK_OPEN, Gtk.ResponseType.OK
+        )
+        
+        # Add file filters based on VPN type
+        if vpn_type == "WireGuard":
+            filter_conf = Gtk.FileFilter()
+            filter_conf.set_name("WireGuard configs (*.conf)")
+            filter_conf.add_pattern("*.conf")
+            dialog.add_filter(filter_conf)
+            
+            # Set default folder
+            if os.path.exists("/etc/wireguard"):
+                dialog.set_current_folder("/etc/wireguard")
+            elif os.path.exists(os.path.expanduser("~/.config/wireguard")):
+                dialog.set_current_folder(os.path.expanduser("~/.config/wireguard"))
+        elif vpn_type == "OpenVPN3":
+            filter_ovpn = Gtk.FileFilter()
+            filter_ovpn.set_name("OpenVPN configs (*.ovpn)")
+            filter_ovpn.add_pattern("*.ovpn")
+            dialog.add_filter(filter_ovpn)
+        
+        filter_all = Gtk.FileFilter()
+        filter_all.set_name("All files")
+        filter_all.add_pattern("*")
+        dialog.add_filter(filter_all)
+        
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            config_path = dialog.get_filename()
+            self.vpn_config_entry.set_text(config_path)
+        
+        dialog.destroy()
     
     def load_vpn_configs(self):
-        """Load available VPN configurations"""
-        try:
-            result = subprocess.run(
-                ["openvpn3", "configs-list"],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
+        """Load available VPN configurations based on selected type"""
+        # Clear existing items
+        self.vpn_config_combo.remove_all()
+        
+        vpn_type = self.vpn_type_combo.get_active_text()
+        
+        if not vpn_type:
+            return
+        
+        if vpn_type == "OpenVPN3":
+            try:
+                result = subprocess.run(
+                    ["openvpn3", "configs-list"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                
+                if result.returncode == 0:
+                    lines = result.stdout.strip().split('\n')
+                    for line in lines[2:]:  # Skip header
+                        if line.strip() and not line.startswith('-'):
+                            parts = line.split()
+                            if len(parts) >= 1:
+                                config_path = parts[0]
+                                self.vpn_config_combo.append_text(config_path)
+            except:
+                pass
+        
+        elif vpn_type == "WireGuard":
+            # Load WireGuard configs from common locations
+            wg_dirs = [
+                "/etc/wireguard",
+                os.path.expanduser("~/.config/wireguard"),
+                os.path.expanduser("~/wireguard")
+            ]
             
-            if result.returncode == 0:
-                lines = result.stdout.strip().split('\n')
-                for line in lines[2:]:  # Skip header
-                    if line.strip() and not line.startswith('-'):
-                        parts = line.split()
-                        if len(parts) >= 1:
-                            config_path = parts[0]
-                            self.vpn_config_combo.append_text(config_path)
-        except:
-            pass
+            configs_found = []
+            for wg_dir in wg_dirs:
+                if os.path.exists(wg_dir):
+                    try:
+                        for file in os.listdir(wg_dir):
+                            if file.endswith('.conf'):
+                                config_path = os.path.join(wg_dir, file)
+                                # Check if readable
+                                if os.access(config_path, os.R_OK):
+                                    configs_found.append(config_path)
+                                else:
+                                    # Try with sudo access notation
+                                    configs_found.append(f"sudo:{config_path}")
+                    except:
+                        pass
+            
+            # Add found configs to combo
+            for config in sorted(configs_found):
+                self.vpn_config_combo.append_text(config)
+        
+        # Restore previous selection if it exists
+        if self.connection_data and "vpn_config" in self.connection_data:
+            vpn_config = self.connection_data["vpn_config"]
+            # Set the text in the entry field
+            self.vpn_config_entry.set_text(vpn_config)
     
     def get_connection_data(self):
         """Get the connection data from the dialog"""
@@ -1553,15 +2204,26 @@ class ConnectionDialog(Gtk.Dialog):
             self.show_error("A connection with this name already exists")
             return None
         
-        vpn_config = self.vpn_config_combo.get_active_text()
-        if not vpn_config:
-            self.show_error("Please select a VPN configuration")
-            return None
+        # Get connection mode
+        connection_mode = self.connection_mode_combo.get_active_text()
         
-        rdp_host = self.rdp_host_entry.get_text().strip()
-        if not rdp_host:
-            self.show_error("Please enter an RDP host")
-            return None
+        # Validate based on connection mode
+        if connection_mode in ["VPN+RDP", "VPN Only"]:
+            # Get VPN config from the entry field
+            vpn_config = self.vpn_config_entry.get_text().strip()
+            if not vpn_config:
+                self.show_error("Please select or enter a VPN configuration")
+                return None
+        else:
+            vpn_config = ""
+        
+        if connection_mode in ["VPN+RDP", "RDP Only"]:
+            rdp_host = self.rdp_host_entry.get_text().strip()
+            if not rdp_host:
+                self.show_error("Please enter an RDP host")
+                return None
+        else:
+            rdp_host = ""
         
         # Parse monitor selection
         selected_monitors = []
@@ -1581,11 +2243,13 @@ class ConnectionDialog(Gtk.Dialog):
         
         return {
             "name": name,
+            "connection_mode": connection_mode,
+            "vpn_type": self.vpn_type_combo.get_active_text() if connection_mode != "RDP Only" else "",
             "vpn_config": vpn_config,
-            "vpn_username": self.vpn_username_entry.get_text().strip(),
+            "vpn_username": self.vpn_username_entry.get_text().strip() if connection_mode != "RDP Only" else "",
             "rdp_host": rdp_host,
-            "rdp_username": self.rdp_username_entry.get_text().strip(),
-            "rdp_domain": self.rdp_domain_entry.get_text().strip(),
+            "rdp_username": self.rdp_username_entry.get_text().strip() if connection_mode != "VPN Only" else "",
+            "rdp_domain": self.rdp_domain_entry.get_text().strip() if connection_mode != "VPN Only" else "",
             "rdp_fullscreen": self.fullscreen_check.get_active(),
             "rdp_resolution": self.resolution_combo.get_active_text(),
             "multimon": self.multimon_check.get_active(),

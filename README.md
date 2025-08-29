@@ -4,8 +4,11 @@ A combined VPN and RDP connection manager for Linux that allows you to connect t
 
 ## Features
 
+- **Dual VPN Protocol Support**: Works with both OpenVPN3 and WireGuard
 - **One-Click Connection**: Save VPN+RDP connection profiles and connect with a single click
-- **Connection Profiles**: Store multiple connection configurations with different VPN and RDP settings
+- **Connection Profiles**: Store multiple connection configurations with different VPN types and RDP settings
+- **Traffic Monitoring**: Real-time traffic charts for both OpenVPN3 and WireGuard connections
+- **Advanced RDP Options**: Multi-monitor support, audio settings, performance tuning
 - **Secure Password Storage**: Passwords can be stored securely using the system keyring
 - **Status Monitoring**: Real-time status display for each connection
 - **GUI Management**: Easy-to-use GTK+ interface for managing connections
@@ -13,7 +16,9 @@ A combined VPN and RDP connection manager for Linux that allows you to connect t
 ## Requirements
 
 - Python 3 with GTK+ bindings
-- OpenVPN3 (`sudo apt install openvpn3`)
+- At least one VPN client:
+  - OpenVPN3 (`sudo apt install openvpn3`) - requires repository setup
+  - WireGuard (`sudo apt install wireguard`) - usually in standard repos
 - FreeRDP (`sudo apt install freerdp2-x11`)
 - Python keyring (optional, for secure password storage)
 
@@ -47,10 +52,14 @@ cp vpnrdp.desktop ~/.local/share/applications/
 2. **Create a new connection profile**:
    - Click "New Connection" button
    - Enter a name for your connection
-   - Select your VPN configuration (must be already imported in OpenVPN3)
-   - Enter VPN username
+   - Select VPN type (OpenVPN3 or WireGuard)
+   - Select your VPN configuration:
+     - For OpenVPN3: Select from imported configurations
+     - For WireGuard: Select from .conf files in ~/.config/wireguard/ or /etc/wireguard/
+   - Enter VPN username (for OpenVPN3)
    - Enter RDP host, username, and optional domain
-   - Configure display settings (fullscreen, resolution)
+   - Configure display settings (fullscreen, resolution, multi-monitor)
+   - Configure advanced options (performance, audio, local resources)
    - Click Save
 
 3. **Connect**:
@@ -79,13 +88,23 @@ cp vpnrdp.desktop ~/.local/share/applications/
 
 ## Importing VPN Configurations
 
-Before using this app, you need to import your VPN configurations into OpenVPN3:
-
+### OpenVPN3
+Import your OpenVPN configurations:
 ```bash
 openvpn3 config-import --config /path/to/your/config.ovpn
 ```
 
-You can then select the imported configuration when creating a connection profile.
+### WireGuard
+Place your WireGuard configuration files in one of these locations:
+- User directory: `~/.config/wireguard/` (no sudo required)
+- System directory: `/etc/wireguard/` (requires sudo)
+
+Or use the built-in import tool:
+- Click Tools → Import WireGuard Config
+- Select your .conf file
+- Choose where to save it
+
+The app will automatically detect WireGuard configurations in these directories.
 
 ## Troubleshooting
 
