@@ -9,7 +9,9 @@ MIT License
 
 import gi
 gi.require_version('Gtk', '3.0')
+gi.require_version('AyatanaAppIndicator3', '0.1')
 from gi.repository import Gtk, GLib, Gdk
+from gi.repository import AyatanaAppIndicator3 as AppIndicator3
 import subprocess
 import threading
 import os
@@ -298,6 +300,93 @@ class VPNRDPManager(Gtk.Window):
         
         # Start traffic monitor
         GLib.timeout_add_seconds(2, self.update_traffic_chart)
+        
+        # Initialize system tray
+        self.init_system_tray()
+        
+        # Connect window delete event to minimize to tray
+        self.connect("delete-event", self.on_delete_event)
+    
+    def init_system_tray(self):
+        """Initialize the system tray icon and menu"""
+        self.indicator = AppIndicator3.Indicator.new(
+            "vpnrdp-manager",
+            "network-vpn",  # Use system VPN icon
+            AppIndicator3.IndicatorCategory.APPLICATION_STATUS
+        )
+        self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+        
+        # Create tray menu
+        self.create_tray_menu()
+    
+    def create_tray_menu(self):
+        """Create the system tray menu"""
+        menu = Gtk.Menu()
+        
+        # Show/Hide window item
+        show_item = Gtk.MenuItem(label="Show/Hide Window")
+        show_item.connect("activate", self.toggle_window_visibility)
+        menu.append(show_item)
+        
+        # Separator
+        separator = Gtk.SeparatorMenuItem()
+        menu.append(separator)
+        
+        # Exit item
+        exit_item = Gtk.MenuItem(label="Exit")
+        exit_item.connect("activate", self.on_exit)
+        menu.append(exit_item)
+        
+        menu.show_all()
+        self.indicator.set_menu(menu)
+    
+    def toggle_window_visibility(self, widget):
+        """Toggle window visibility when tray icon is clicked"""
+        if self.get_visible():
+            self.hide()
+        else:
+            self.show()
+            self.present()  # Bring window to front
+    
+    def on_delete_event(self, widget, event):
+        """Handle window close event - minimize to tray instead of closing"""
+        self.hide()
+        return True  # Prevent window destruction
+    
+    def on_exit(self, widget):
+        """Handle exit with confirmation if connections are active"""
+        # Check for active connections
+        active_conns = []
+        for name, info in self.active_connections.items():
+            if info.get("status") in ["Connected", "Connecting..."]:
+                active_conns.append(name)
+        
+        if active_conns:
+            # Show warning dialog
+            dialog = Gtk.MessageDialog(
+                parent=self,
+                flags=Gtk.DialogFlags.MODAL,
+                type=Gtk.MessageType.WARNING,
+                buttons=Gtk.ButtonsType.YES_NO,
+                message_format="Active Connections Warning"
+            )
+            dialog.format_secondary_text(
+                f"The following connections are active:\n\n{', '.join(active_conns)}\n\n"
+                "Exiting will close all connections. Do you want to continue?"
+            )
+            
+            response = dialog.run()
+            dialog.destroy()
+            
+            if response != Gtk.ResponseType.YES:
+                return
+            
+            # Disconnect all active connections
+            for name in active_conns:
+                self.disconnect(name)
+        
+        # Exit the application
+        Gtk.main_quit()
     
     def status_cell_data_func(self, column, cell, model, iter, data):
         """Color code the status column"""
@@ -2414,6 +2503,5 @@ class ConnectionDialog(Gtk.Dialog):
 
 if __name__ == "__main__":
     win = VPNRDPManager()
-    win.connect("destroy", Gtk.main_quit)
     win.show_all()
     Gtk.main()
