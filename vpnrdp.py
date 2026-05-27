@@ -9,9 +9,19 @@ MIT License
 
 import gi
 gi.require_version('Gtk', '3.0')
-gi.require_version('AyatanaAppIndicator3', '0.1')
 from gi.repository import Gtk, GLib, Gdk
-from gi.repository import AyatanaAppIndicator3 as AppIndicator3
+try:
+    gi.require_version('AyatanaAppIndicator3', '0.1')
+    from gi.repository import AyatanaAppIndicator3 as AppIndicator3
+    APPINDICATOR_AVAILABLE = True
+except (ImportError, ValueError):
+    try:
+        gi.require_version('AppIndicator3', '0.1')
+        from gi.repository import AppIndicator3
+        APPINDICATOR_AVAILABLE = True
+    except (ImportError, ValueError):
+        AppIndicator3 = None
+        APPINDICATOR_AVAILABLE = False
 import subprocess
 import threading
 import os
@@ -20,7 +30,100 @@ import json
 import time
 import signal
 import re
+import sys
 from collections import deque
+
+
+def suppress_appindicator_deprecation_warning(log_domain, log_level, message):
+    """Hide the known libayatana-appindicator deprecation warning."""
+    if "libayatana-appindicator is deprecated" in message:
+        return
+    print(f"{log_domain}: {message}", file=sys.stderr)
+
+
+def detect_os():
+    """Detect the local OS family and package manager."""
+    info = {
+        "id": "",
+        "name": "Linux",
+        "id_like": "",
+        "family": "unknown",
+        "package_manager": "unknown"
+    }
+
+    try:
+        with open("/etc/os-release", "r") as os_release:
+            for line in os_release:
+                if "=" not in line:
+                    continue
+                key, value = line.rstrip().split("=", 1)
+                value = value.strip('"')
+                if key == "ID":
+                    info["id"] = value.lower()
+                elif key == "NAME":
+                    info["name"] = value
+                elif key == "ID_LIKE":
+                    info["id_like"] = value.lower()
+    except OSError:
+        pass
+
+    os_tokens = {info["id"], *info["id_like"].split()}
+    if os_tokens & {"arch", "cachyos", "manjaro", "endeavouros"} or shutil.which("pacman"):
+        info["family"] = "arch"
+        info["package_manager"] = "pacman"
+    elif os_tokens & {"debian", "ubuntu", "linuxmint"} or shutil.which("apt"):
+        info["family"] = "debian"
+        info["package_manager"] = "apt"
+
+    return info
+
+
+OS_INFO = detect_os()
+
+
+PACKAGE_MAP = {
+    "networkmanager_openvpn": {
+        "arch": ["networkmanager-openvpn"],
+        "debian": ["network-manager-openvpn", "network-manager-openvpn-gnome"]
+    },
+    "openvpn3": {
+        "arch": ["openvpn3"],
+        "debian": ["openvpn3"]
+    },
+    "wireguard": {
+        "arch": ["wireguard-tools"],
+        "debian": ["wireguard"]
+    },
+    "freerdp": {
+        "arch": ["freerdp"],
+        "debian": ["freerdp2-x11"]
+    },
+    "gtk": {
+        "arch": ["python-gobject", "gtk3"],
+        "debian": ["python3-gi", "python3-gi-cairo", "gir1.2-gtk-3.0"]
+    },
+    "keyring": {
+        "arch": ["python-keyring", "python-secretstorage", "kwallet"],
+        "debian": ["python3-keyring", "python3-secretstorage", "gnome-keyring"]
+    },
+    "ayatana": {
+        "arch": ["libayatana-appindicator"],
+        "debian": ["gir1.2-ayatanaappindicator3-0.1"]
+    }
+}
+
+
+def package_install_command(package_key):
+    """Return a package install command for the detected OS."""
+    packages = PACKAGE_MAP.get(package_key, {})
+    family_packages = packages.get(OS_INFO["family"])
+    if not family_packages:
+        return "Install with your distribution package manager"
+    if OS_INFO["package_manager"] == "pacman":
+        return f"sudo pacman -S --needed {' '.join(family_packages)}"
+    if OS_INFO["package_manager"] == "apt":
+        return f"sudo apt update && sudo apt install {' '.join(family_packages)}"
+    return "Install with your distribution package manager"
 
 # Check if keyring module is available
 try:
@@ -97,6 +200,11 @@ class VPNRDPManager(Gtk.Window):
         
         # Create tools menu
         tools_menu = Gtk.Menu()
+
+        # Install NetworkManager OpenVPN menu item
+        nm_item = Gtk.MenuItem(label="Install NetworkManager OpenVPN...")
+        nm_item.connect("activate", self.show_networkmanager_openvpn_install)
+        tools_menu.append(nm_item)
         
         # Install WireGuard menu item
         wg_item = Gtk.MenuItem(label="Install WireGuard...")
@@ -309,15 +417,38 @@ class VPNRDPManager(Gtk.Window):
     
     def init_system_tray(self):
         """Initialize the system tray icon and menu"""
-        self.indicator = AppIndicator3.Indicator.new(
-            "vpnrdp-manager",
-            "network-vpn",  # Use system VPN icon
-            AppIndicator3.IndicatorCategory.APPLICATION_STATUS
-        )
-        self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
-        
-        # Create tray menu
-        self.create_tray_menu()
+        self.tray_backend = None
+        self.indicator = None
+        self.status_icon = None
+        self.tray_menu = self.create_tray_menu()
+
+        if APPINDICATOR_AVAILABLE:
+            GLib.log_set_handler(
+                "libayatana-appindicator",
+                GLib.LogLevelFlags.LEVEL_WARNING,
+                suppress_appindicator_deprecation_warning
+            )
+            self.indicator = AppIndicator3.Indicator.new(
+                "vpnrdp-manager",
+                "network-vpn",
+                AppIndicator3.IndicatorCategory.APPLICATION_STATUS
+            )
+            self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+            self.indicator.set_menu(self.tray_menu)
+            self.tray_backend = "appindicator"
+            return
+
+        try:
+            self.status_icon = Gtk.StatusIcon.new_from_icon_name("network-vpn")
+            self.status_icon.set_tooltip_text("VPN+RDP Manager")
+            self.status_icon.set_visible(True)
+            self.status_icon.connect("activate", self.toggle_window_visibility)
+            self.status_icon.connect("popup-menu", self.on_status_icon_popup_menu)
+            self.tray_backend = "statusicon"
+            self.update_status("Ready (legacy tray icon)")
+        except Exception as e:
+            self.status_icon = None
+            self.update_status(f"Ready (tray unavailable: {e})")
     
     def create_tray_menu(self):
         """Create the system tray menu"""
@@ -338,7 +469,11 @@ class VPNRDPManager(Gtk.Window):
         menu.append(exit_item)
         
         menu.show_all()
-        self.indicator.set_menu(menu)
+        return menu
+
+    def on_status_icon_popup_menu(self, icon, button, activate_time):
+        """Show the legacy Gtk.StatusIcon context menu."""
+        self.tray_menu.popup(None, None, None, None, button, activate_time)
     
     def toggle_window_visibility(self, widget):
         """Toggle window visibility when tray icon is clicked"""
@@ -349,9 +484,14 @@ class VPNRDPManager(Gtk.Window):
             self.present()  # Bring window to front
     
     def on_delete_event(self, widget, event):
-        """Handle window close event - minimize to tray instead of closing"""
-        self.hide()
-        return True  # Prevent window destruction
+        """Minimize to tray when available; otherwise quit visibly."""
+        if self.tray_backend:
+            self.hide()
+            self.update_status("Hidden to system tray")
+            return True
+
+        self.on_exit(widget)
+        return True
     
     def on_exit(self, widget):
         """Handle exit with confirmation if connections are active"""
@@ -407,6 +547,11 @@ class VPNRDPManager(Gtk.Window):
         
         # Check for at least one VPN solution
         has_vpn = False
+        if shutil.which("nmcli"):
+            has_vpn = True
+        else:
+            optional_missing.append("NetworkManager")
+
         if shutil.which("openvpn3"):
             has_vpn = True
         else:
@@ -418,7 +563,7 @@ class VPNRDPManager(Gtk.Window):
             optional_missing.append("WireGuard")
         
         if not has_vpn:
-            missing.append("VPN client (OpenVPN3 or WireGuard)")
+            missing.append("VPN client (NetworkManager, OpenVPN3, or WireGuard)")
         
         if not shutil.which("xfreerdp") and not shutil.which("xfreerdp3"):
             missing.append("FreeRDP")
@@ -433,10 +578,12 @@ class VPNRDPManager(Gtk.Window):
             )
             dialog.format_secondary_text(
                 f"The following required programs are not installed:\n{', '.join(missing)}\n\n"
+                f"Detected OS: {OS_INFO['name']} ({OS_INFO['family']})\n\n"
                 "Please install at least one VPN client:\n"
-                "• OpenVPN3: sudo apt install openvpn3\n"
-                "• WireGuard: sudo apt install wireguard\n"
-                "• FreeRDP: sudo apt install freerdp2-x11"
+                f"• NetworkManager OpenVPN: {package_install_command('networkmanager_openvpn')}\n"
+                f"• OpenVPN3: {package_install_command('openvpn3')}\n"
+                f"• WireGuard: {package_install_command('wireguard')}\n"
+                f"• FreeRDP: {package_install_command('freerdp')}"
             )
             dialog.run()
             dialog.destroy()
@@ -595,10 +742,17 @@ class VPNRDPManager(Gtk.Window):
     
     def show_connecting_dialog(self, name, conn):
         """Show a dialog while connecting"""
+        conn = dict(conn)
+        if not self.collect_connection_passwords(name, conn):
+            self.update_connection_status(name, "Canceled")
+            self.update_status("Connection canceled")
+            self.connect_button.set_sensitive(True)
+            return
+
         dialog = Gtk.Dialog(
             title=f"Connecting to {name}",
-            parent=self,
-            flags=Gtk.DialogFlags.MODAL
+            transient_for=self,
+            modal=True
         )
         dialog.set_default_size(400, 200)
         dialog.set_resizable(False)
@@ -661,6 +815,7 @@ class VPNRDPManager(Gtk.Window):
         self.connecting_status_label = status_label
         self.connecting_progress = progress_bar
         self.connecting_canceled = False
+        self.connecting_thread_done = False
         
         # Start connection in background thread
         thread = threading.Thread(target=self.connection_worker_with_dialog, args=(name, conn, dialog))
@@ -680,9 +835,51 @@ class VPNRDPManager(Gtk.Window):
         elif response != Gtk.ResponseType.OK:
             # Connection failed or dialog closed
             self.connect_button.set_sensitive(True)  # Re-enable connect button
+
+        self.connecting_canceled = True
         
         dialog.destroy()
         self.connecting_dialog = None
+
+    def collect_connection_passwords(self, name, conn):
+        """Prompt for passwords on the GTK main thread before worker startup."""
+        connection_mode = conn.get("connection_mode", "VPN+RDP")
+        vpn_type = conn.get("vpn_type", "OpenVPN3")
+
+        if connection_mode in ["VPN+RDP", "VPN Only"] and vpn_type == "OpenVPN3":
+            vpn_password = self.get_password(name, "vpn")
+            if not vpn_password:
+                return False
+            conn["_vpn_password"] = vpn_password
+
+        if connection_mode in ["VPN+RDP", "RDP Only"]:
+            rdp_password = self.get_password(name, "rdp")
+            if not rdp_password:
+                return False
+            conn["_rdp_password"] = rdp_password
+
+        return True
+
+    def safe_dialog_response(self, dialog, response):
+        """Respond to a dialog only if it has not been canceled/destroyed."""
+        if self.connecting_canceled or self.connecting_dialog is not dialog:
+            return False
+        dialog.response(response)
+        return False
+
+    def safe_set_connecting_status(self, dialog, message):
+        """Update connecting status only while the dialog is current."""
+        if self.connecting_canceled or self.connecting_dialog is not dialog:
+            return False
+        self.connecting_status_label.set_text(message)
+        return False
+
+    def safe_set_connecting_progress(self, dialog, fraction):
+        """Update connecting progress only while the dialog is current."""
+        if self.connecting_canceled or self.connecting_dialog is not dialog:
+            return False
+        self.connecting_progress.set_fraction(fraction)
+        return False
     
     def connection_worker_with_dialog(self, name, conn, dialog):
         """Worker thread for establishing connection with dialog updates"""
@@ -691,8 +888,8 @@ class VPNRDPManager(Gtk.Window):
             
             # Handle VPN-only connections
             if connection_mode == "VPN Only":
-                GLib.idle_add(self.connecting_status_label.set_text, "Establishing VPN connection...")
-                GLib.idle_add(self.connecting_progress.set_fraction, 0.5)
+                GLib.idle_add(self.safe_set_connecting_status, dialog, "Establishing VPN connection...")
+                GLib.idle_add(self.safe_set_connecting_progress, dialog, 0.5)
                 
                 if self.connecting_canceled:
                     return
@@ -701,26 +898,26 @@ class VPNRDPManager(Gtk.Window):
                 vpn_success = self.connect_vpn(name, conn)
                 
                 if vpn_success:
-                    GLib.idle_add(self.connecting_status_label.set_text, "VPN connection established successfully!")
-                    GLib.idle_add(self.connecting_progress.set_fraction, 1.0)
+                    GLib.idle_add(self.safe_set_connecting_status, dialog, "VPN connection established successfully!")
+                    GLib.idle_add(self.safe_set_connecting_progress, dialog, 1.0)
                     GLib.idle_add(self.update_connection_status, name, "VPN Connected")
                     GLib.idle_add(self.update_status, f"VPN connected: {name}")
                     GLib.idle_add(self.update_buttons, True)
                     time.sleep(1)
-                    GLib.idle_add(dialog.response, Gtk.ResponseType.OK)
+                    GLib.idle_add(self.safe_dialog_response, dialog, Gtk.ResponseType.OK)
                 else:
-                    GLib.idle_add(self.connecting_status_label.set_text, "VPN connection failed!")
+                    GLib.idle_add(self.safe_set_connecting_status, dialog, "VPN connection failed!")
                     GLib.idle_add(self.update_connection_status, name, "VPN Failed")
                     GLib.idle_add(self.update_status, f"VPN connection failed for {name}")
                     GLib.idle_add(self.update_buttons, False)
                     time.sleep(2)
-                    GLib.idle_add(dialog.response, Gtk.ResponseType.CLOSE)
+                    GLib.idle_add(self.safe_dialog_response, dialog, Gtk.ResponseType.CLOSE)
                 return
             
             # Handle RDP-only connections
             elif connection_mode == "RDP Only":
-                GLib.idle_add(self.connecting_status_label.set_text, "Establishing RDP connection...")
-                GLib.idle_add(self.connecting_progress.set_fraction, 0.5)
+                GLib.idle_add(self.safe_set_connecting_status, dialog, "Establishing RDP connection...")
+                GLib.idle_add(self.safe_set_connecting_progress, dialog, 0.5)
                 
                 if self.connecting_canceled:
                     return
@@ -729,27 +926,27 @@ class VPNRDPManager(Gtk.Window):
                 rdp_success = self.connect_rdp(name, conn)
                 
                 if rdp_success:
-                    GLib.idle_add(self.connecting_status_label.set_text, "RDP connection established successfully!")
-                    GLib.idle_add(self.connecting_progress.set_fraction, 1.0)
+                    GLib.idle_add(self.safe_set_connecting_status, dialog, "RDP connection established successfully!")
+                    GLib.idle_add(self.safe_set_connecting_progress, dialog, 1.0)
                     GLib.idle_add(self.update_connection_status, name, "RDP Connected")
                     GLib.idle_add(self.update_status, f"RDP connected: {name}")
                     GLib.idle_add(self.update_buttons, True)
                     time.sleep(1)
-                    GLib.idle_add(dialog.response, Gtk.ResponseType.OK)
+                    GLib.idle_add(self.safe_dialog_response, dialog, Gtk.ResponseType.OK)
                 else:
-                    GLib.idle_add(self.connecting_status_label.set_text, "RDP connection failed!")
+                    GLib.idle_add(self.safe_set_connecting_status, dialog, "RDP connection failed!")
                     GLib.idle_add(self.update_connection_status, name, "RDP Failed")
                     GLib.idle_add(self.update_status, f"RDP connection failed for {name}")
                     GLib.idle_add(self.update_buttons, False)
                     time.sleep(2)
-                    GLib.idle_add(dialog.response, Gtk.ResponseType.CLOSE)
+                    GLib.idle_add(self.safe_dialog_response, dialog, Gtk.ResponseType.CLOSE)
                 return
             
             # Handle VPN+RDP connections (default)
             else:
                 # Update dialog: Connecting to VPN
-                GLib.idle_add(self.connecting_status_label.set_text, "Establishing VPN connection...")
-                GLib.idle_add(self.connecting_progress.set_fraction, 0.25)
+                GLib.idle_add(self.safe_set_connecting_status, dialog, "Establishing VPN connection...")
+                GLib.idle_add(self.safe_set_connecting_progress, dialog, 0.25)
                 
                 if self.connecting_canceled:
                     return
@@ -758,12 +955,12 @@ class VPNRDPManager(Gtk.Window):
                 vpn_success = self.connect_vpn(name, conn)
                 
                 if not vpn_success:
-                    GLib.idle_add(self.connecting_status_label.set_text, "VPN connection failed!")
+                    GLib.idle_add(self.safe_set_connecting_status, dialog, "VPN connection failed!")
                     GLib.idle_add(self.update_connection_status, name, "VPN Failed")
                     GLib.idle_add(self.update_status, f"VPN connection failed for {name}")
                     GLib.idle_add(self.update_buttons, False)
                     time.sleep(2)  # Show error briefly
-                    GLib.idle_add(dialog.response, Gtk.ResponseType.CLOSE)
+                    GLib.idle_add(self.safe_dialog_response, dialog, Gtk.ResponseType.CLOSE)
                     return
                 
                 if self.connecting_canceled:
@@ -771,8 +968,8 @@ class VPNRDPManager(Gtk.Window):
                     return
                 
                 # Update dialog: VPN connected, connecting to RDP
-                GLib.idle_add(self.connecting_status_label.set_text, "VPN connected! Establishing RDP connection...")
-                GLib.idle_add(self.connecting_progress.set_fraction, 0.75)
+                GLib.idle_add(self.safe_set_connecting_status, dialog, "VPN connected! Establishing RDP connection...")
+                GLib.idle_add(self.safe_set_connecting_progress, dialog, 0.75)
                 
                 # Wait for VPN to stabilize
                 time.sleep(3)
@@ -785,30 +982,30 @@ class VPNRDPManager(Gtk.Window):
                 rdp_success = self.connect_rdp(name, conn)
                 
                 if rdp_success:
-                    GLib.idle_add(self.connecting_status_label.set_text, "Connection established successfully!")
-                    GLib.idle_add(self.connecting_progress.set_fraction, 1.0)
+                    GLib.idle_add(self.safe_set_connecting_status, dialog, "Connection established successfully!")
+                    GLib.idle_add(self.safe_set_connecting_progress, dialog, 1.0)
                     GLib.idle_add(self.update_connection_status, name, "Connected")
                     GLib.idle_add(self.update_status, f"Connected to {name}")
                     GLib.idle_add(self.update_buttons, True)
                     time.sleep(1)  # Show success briefly
-                    GLib.idle_add(dialog.response, Gtk.ResponseType.OK)
+                    GLib.idle_add(self.safe_dialog_response, dialog, Gtk.ResponseType.OK)
                 else:
                     # RDP failed, disconnect VPN
-                    GLib.idle_add(self.connecting_status_label.set_text, "RDP connection failed!")
+                    GLib.idle_add(self.safe_set_connecting_status, dialog, "RDP connection failed!")
                     self.disconnect_vpn(name)
                     GLib.idle_add(self.update_connection_status, name, "RDP Failed")
                     GLib.idle_add(self.update_status, f"RDP connection failed for {name}")
                     GLib.idle_add(self.update_buttons, False)
                     time.sleep(2)  # Show error briefly
-                    GLib.idle_add(dialog.response, Gtk.ResponseType.CLOSE)
+                    GLib.idle_add(self.safe_dialog_response, dialog, Gtk.ResponseType.CLOSE)
         
         except Exception as e:
-            GLib.idle_add(self.connecting_status_label.set_text, f"Error: {str(e)}")
+            GLib.idle_add(self.safe_set_connecting_status, dialog, f"Error: {str(e)}")
             GLib.idle_add(self.update_connection_status, name, "Error")
             GLib.idle_add(self.update_status, f"Error connecting to {name}: {str(e)}")
             GLib.idle_add(self.update_buttons, False)
             time.sleep(2)  # Show error briefly
-            GLib.idle_add(dialog.response, Gtk.ResponseType.CLOSE)
+            GLib.idle_add(self.safe_dialog_response, dialog, Gtk.ResponseType.CLOSE)
     
     def connection_worker(self, name, conn):
         """Worker thread for establishing connection"""
@@ -853,18 +1050,68 @@ class VPNRDPManager(Gtk.Window):
         
         if vpn_type == "OpenVPN3":
             return self.connect_openvpn3(name, conn)
+        elif vpn_type == "NetworkManager":
+            return self.connect_networkmanager(name, conn)
         elif vpn_type == "WireGuard":
             return self.connect_wireguard(name, conn)
         else:
+            return False
+
+    def connect_networkmanager(self, name, conn):
+        """Connect using an existing NetworkManager VPN profile."""
+        vpn_config = conn.get("vpn_config")
+
+        if not vpn_config:
+            return False
+
+        try:
+            result = subprocess.run(
+                ["nmcli", "connection", "up", "id", vpn_config],
+                capture_output=True,
+                text=True,
+                timeout=45
+            )
+
+            if result.returncode == 0 or self.is_networkmanager_connection_active(vpn_config):
+                self.active_connections[name] = {
+                    "vpn_type": "NetworkManager",
+                    "vpn_config": vpn_config,
+                    "status": "VPN Connected"
+                }
+                return True
+
+            print(f"NetworkManager connection failed: {result.stderr.strip() or result.stdout.strip()}")
+            return False
+
+        except Exception as e:
+            print(f"NetworkManager connection error: {e}")
+            return False
+
+    def is_networkmanager_connection_active(self, connection_name):
+        """Return True if NetworkManager reports the connection as active."""
+        try:
+            result = subprocess.run(
+                ["nmcli", "-t", "--escape", "no", "-f", "NAME", "connection", "show", "--active"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode != 0:
+                return False
+            return connection_name in result.stdout.splitlines()
+        except Exception:
             return False
     
     def connect_openvpn3(self, name, conn):
         """Connect using OpenVPN3"""
         vpn_config = conn.get("vpn_config")
         vpn_username = conn.get("vpn_username")
-        vpn_password = self.get_password(name, "vpn")
+        vpn_password = conn.get("_vpn_password")
         
         if not vpn_config or not os.path.exists(vpn_config):
+            return False
+        if vpn_password is None:
+            print("OpenVPN3 password was not collected before worker startup")
             return False
         
         try:
@@ -975,9 +1222,12 @@ class VPNRDPManager(Gtk.Window):
         rdp_host = conn.get("rdp_host")
         rdp_username = conn.get("rdp_username")
         rdp_domain = conn.get("rdp_domain", "")
-        rdp_password = self.get_password(name, "rdp")
+        rdp_password = conn.get("_rdp_password")
         
         if not rdp_host:
+            return False
+        if rdp_password is None:
+            print("RDP password was not collected before worker startup")
             return False
         
         # Find xfreerdp command
@@ -1153,6 +1403,18 @@ class VPNRDPManager(Gtk.Window):
                         )
                     except:
                         pass
+
+            elif vpn_type == "NetworkManager":
+                vpn_config = conn_info.get("vpn_config")
+                if vpn_config:
+                    try:
+                        subprocess.run(
+                            ["nmcli", "connection", "down", "id", vpn_config],
+                            capture_output=True,
+                            timeout=10
+                        )
+                    except:
+                        pass
             
             elif vpn_type == "WireGuard":
                 vpn_config = conn_info.get("vpn_config")
@@ -1173,6 +1435,12 @@ class VPNRDPManager(Gtk.Window):
         """Monitor active connections"""
         for name in list(self.active_connections.keys()):
             conn_info = self.active_connections[name]
+
+            if conn_info.get("vpn_type") == "NetworkManager":
+                vpn_config = conn_info.get("vpn_config")
+                if vpn_config and not self.is_networkmanager_connection_active(vpn_config):
+                    self.disconnect(name)
+                    continue
             
             # Check RDP process
             if "rdp_process" in conn_info:
@@ -1187,7 +1455,7 @@ class VPNRDPManager(Gtk.Window):
         """Update status for a specific connection in the list"""
         for row in self.liststore:
             if row[0] == name:
-                row[4] = status
+                row[5] = status
                 break
     
     def update_status(self, message):
@@ -1215,8 +1483,8 @@ class VPNRDPManager(Gtk.Window):
         # Prompt for password
         dialog = Gtk.Dialog(
             title=f"Enter {service_type.upper()} Password",
-            parent=self,
-            flags=0
+            transient_for=self,
+            modal=True
         )
         dialog.add_buttons(
             Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
@@ -1588,6 +1856,7 @@ class VPNRDPManager(Gtk.Window):
     
     def show_wireguard_install(self, widget):
         """Show WireGuard installation dialog"""
+        install_command = package_install_command("wireguard")
         dialog = Gtk.MessageDialog(
             transient_for=self,
             flags=0,
@@ -1598,7 +1867,7 @@ class VPNRDPManager(Gtk.Window):
         dialog.format_secondary_text(
             "WireGuard is a modern, fast VPN protocol.\n\n"
             "To install WireGuard, run:\n"
-            "sudo apt update && sudo apt install wireguard\n\n"
+            f"{install_command}\n\n"
             "Click OK to copy the command to clipboard."
         )
         
@@ -1607,11 +1876,38 @@ class VPNRDPManager(Gtk.Window):
         
         if response == Gtk.ResponseType.OK:
             clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
-            clipboard.set_text("sudo apt update && sudo apt install wireguard", -1)
+            clipboard.set_text(install_command, -1)
             self.update_status("WireGuard install command copied to clipboard")
+
+    def show_networkmanager_openvpn_install(self, widget):
+        """Show NetworkManager OpenVPN installation dialog"""
+        install_command = package_install_command("networkmanager_openvpn")
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            flags=0,
+            message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text="Install NetworkManager OpenVPN"
+        )
+        dialog.format_secondary_text(
+            f"Detected OS: {OS_INFO['name']} ({OS_INFO['family']})\n\n"
+            "This backend uses VPN profiles already configured in KDE/NetworkManager.\n\n"
+            "To install NetworkManager OpenVPN support, run:\n"
+            f"{install_command}\n\n"
+            "Click OK to copy the command to clipboard."
+        )
+
+        response = dialog.run()
+        dialog.destroy()
+
+        if response == Gtk.ResponseType.OK:
+            clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            clipboard.set_text(install_command, -1)
+            self.update_status("NetworkManager OpenVPN install command copied to clipboard")
     
     def show_openvpn3_install(self, widget):
         """Show OpenVPN3 installation dialog"""
+        install_command = package_install_command("openvpn3")
         dialog = Gtk.MessageDialog(
             transient_for=self,
             flags=0,
@@ -1620,13 +1916,13 @@ class VPNRDPManager(Gtk.Window):
             text="Install OpenVPN3"
         )
         dialog.format_secondary_text(
-            "OpenVPN3 requires adding a repository.\n\n"
-            "To install OpenVPN3:\n"
-            "1. Add the OpenVPN repository\n"
-            "2. Run: sudo apt update && sudo apt install openvpn3\n\n"
+            f"Detected OS: {OS_INFO['name']} ({OS_INFO['family']})\n\n"
+            "OpenVPN3 may require an additional repository or AUR package depending on your distribution.\n\n"
+            "Suggested install command:\n"
+            f"{install_command}\n\n"
             "For detailed instructions, visit:\n"
             "https://openvpn.net/cloud-docs/openvpn-3-client-for-linux/\n\n"
-            "Click OK to copy the basic command to clipboard."
+            "Click OK to copy the suggested command to clipboard."
         )
         
         response = dialog.run()
@@ -1634,7 +1930,7 @@ class VPNRDPManager(Gtk.Window):
         
         if response == Gtk.ResponseType.OK:
             clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
-            clipboard.set_text("sudo apt update && sudo apt install openvpn3", -1)
+            clipboard.set_text(install_command, -1)
             self.update_status("OpenVPN3 install command copied to clipboard")
     
     def import_wireguard_config(self, widget):
@@ -1768,7 +2064,7 @@ class ConnectionDialog(Gtk.Dialog):
         else:
             title = "New Connection"
         
-        Gtk.Dialog.__init__(self, title=title, parent=parent, flags=0)
+        Gtk.Dialog.__init__(self, title=title, transient_for=parent)
         self.add_buttons(
             Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
             Gtk.STOCK_SAVE, Gtk.ResponseType.OK
@@ -1845,10 +2141,19 @@ class ConnectionDialog(Gtk.Dialog):
         type_box.pack_start(label, False, False, 0)
         
         self.vpn_type_combo = Gtk.ComboBoxText()
-        if shutil.which("openvpn3"):
-            self.vpn_type_combo.append_text("OpenVPN3")
-        if shutil.which("wg") and shutil.which("wg-quick"):
-            self.vpn_type_combo.append_text("WireGuard")
+        vpn_types = []
+        if OS_INFO["family"] == "arch":
+            vpn_types = ["NetworkManager", "WireGuard", "OpenVPN3"]
+        else:
+            vpn_types = ["OpenVPN3", "NetworkManager", "WireGuard"]
+
+        for vpn_type in vpn_types:
+            if vpn_type == "NetworkManager" and shutil.which("nmcli"):
+                self.vpn_type_combo.append_text(vpn_type)
+            elif vpn_type == "OpenVPN3" and shutil.which("openvpn3"):
+                self.vpn_type_combo.append_text(vpn_type)
+            elif vpn_type == "WireGuard" and shutil.which("wg") and shutil.which("wg-quick"):
+                self.vpn_type_combo.append_text(vpn_type)
         
         type_box.pack_start(self.vpn_type_combo, True, True, 0)
         
@@ -1866,7 +2171,7 @@ class ConnectionDialog(Gtk.Dialog):
         # Use ComboBoxText with entry for manual input
         self.vpn_config_combo = Gtk.ComboBoxText.new_with_entry()
         self.vpn_config_entry = self.vpn_config_combo.get_child()  # Get the entry widget
-        self.vpn_config_entry.set_placeholder_text("Select or enter config path")
+        self.vpn_config_entry.set_placeholder_text("Select or enter VPN profile/config")
         config_box.pack_start(self.vpn_config_combo, True, True, 0)
         
         # Browse button for config file
@@ -1884,13 +2189,13 @@ class ConnectionDialog(Gtk.Dialog):
         self.username_box.pack_start(label, False, False, 0)
         
         self.vpn_username_entry = Gtk.Entry()
-        self.vpn_username_entry.set_placeholder_text("Required for OpenVPN3")
+        self.vpn_username_entry.set_placeholder_text("Required for some OpenVPN3 profiles")
         self.vpn_username_entry.set_text(self.connection_data.get("vpn_username", ""))
         self.username_box.pack_start(self.vpn_username_entry, True, True, 0)
         
         # Set initial sensitivity based on VPN type
         current_vpn_type = self.connection_data.get("vpn_type", "")
-        if current_vpn_type == "WireGuard":
+        if current_vpn_type in ["NetworkManager", "WireGuard"]:
             self.vpn_username_entry.set_sensitive(False)
         
         # RDP Settings Frame
@@ -2151,8 +2456,10 @@ class ConnectionDialog(Gtk.Dialog):
         # Show/hide username field based on VPN type
         vpn_type = self.vpn_type_combo.get_active_text()
         if hasattr(self, 'vpn_username_entry'):
-            # WireGuard doesn't need username
+            # NetworkManager and WireGuard handle credentials outside this field.
             self.vpn_username_entry.set_sensitive(vpn_type == "OpenVPN3")
+        if hasattr(self, 'browse_config_button'):
+            self.browse_config_button.set_sensitive(vpn_type != "NetworkManager")
     
     def on_connection_mode_changed(self, widget):
         """Handle connection mode selection change"""
@@ -2175,6 +2482,10 @@ class ConnectionDialog(Gtk.Dialog):
     def browse_vpn_config(self, widget):
         """Browse for VPN configuration file"""
         vpn_type = self.vpn_type_combo.get_active_text()
+
+        if vpn_type == "NetworkManager":
+            self.show_info("NetworkManager VPN profiles are selected from the list. You can also type an existing profile name.")
+            return
         
         dialog = Gtk.FileChooserDialog(
             title=f"Select {vpn_type} Configuration",
@@ -2226,7 +2537,30 @@ class ConnectionDialog(Gtk.Dialog):
         if not vpn_type:
             return
         
-        if vpn_type == "OpenVPN3":
+        if vpn_type == "NetworkManager":
+            try:
+                result = subprocess.run(
+                    ["nmcli", "-t", "--escape", "no", "-f", "NAME,TYPE", "connection", "show"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+
+                if result.returncode == 0:
+                    configs_found = []
+                    for line in result.stdout.splitlines():
+                        if ":" not in line:
+                            continue
+                        name, conn_type = line.rsplit(":", 1)
+                        if conn_type in ["vpn", "wireguard"]:
+                            configs_found.append(name)
+
+                    for config in sorted(configs_found):
+                        self.vpn_config_combo.append_text(config)
+            except:
+                pass
+
+        elif vpn_type == "OpenVPN3":
             try:
                 result = subprocess.run(
                     ["openvpn3", "configs-list"],
@@ -2355,124 +2689,103 @@ class ConnectionDialog(Gtk.Dialog):
             "nla": self.nla_check.get_active()
         }
     
-    def identify_monitors(self, widget):
-        """Show monitor identification windows"""
+    def identify_monitors(self, widget=None):
+        """Show a numbered overlay on each monitor."""
         try:
-            # Get monitor information using xrandr
-            result = subprocess.run(
-                ["xrandr", "--query"],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            
-            if result.returncode != 0:
-                self.show_error("Could not get monitor information")
+            display = Gdk.Display.get_default()
+            if display is None:
+                self.show_error("Could not get display information")
                 return
-            
-            # Parse xrandr output
-            monitors = []
-            monitor_index = 0
-            
-            for line in result.stdout.split('\n'):
-                if ' connected' in line and not 'disconnected' in line:
-                    # Extract monitor info
-                    parts = line.split()
-                    name = parts[0]
-                    
-                    # Find resolution and position
-                    for part in parts:
-                        match = re.match(r'(\d+)x(\d+)\+(\d+)\+(\d+)', part)
-                        if match:
-                            width = int(match.group(1))
-                            height = int(match.group(2))
-                            x = int(match.group(3))
-                            y = int(match.group(4))
-                            monitors.append({
-                                'index': monitor_index,
-                                'name': name,
-                                'width': width,
-                                'height': height,
-                                'x': x,
-                                'y': y
-                            })
-                            monitor_index += 1
-                            break
-            
-            if not monitors:
+
+            n_monitors = display.get_n_monitors()
+            if n_monitors == 0:
                 self.show_info("No monitors detected")
                 return
-            
+
             # Create identification windows
             id_windows = []
-            
-            for mon in monitors:
+
+            for index in range(n_monitors):
+                monitor = display.get_monitor(index)
+                geo = monitor.get_geometry()
+                name = monitor.get_model() or f"Output {index}"
+
                 window = Gtk.Window()
-                window.set_title(f"Monitor {mon['index']}")
+                window.set_title(f"Monitor {index}")
                 window.set_decorated(False)
                 window.set_keep_above(True)
-                window.set_default_size(400, 300)
-                
-                # Position window on the monitor
-                window.move(mon['x'] + (mon['width'] - 400) // 2,
-                           mon['y'] + (mon['height'] - 300) // 2)
-                
-                # Create content
-                vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-                vbox.set_border_width(20)
-                window.add(vbox)
-                
-                # Add background color
+
+                screen = window.get_screen()
+                rgba_visual = screen.get_rgba_visual()
+                transparent = rgba_visual is not None and screen.is_composited()
+                if transparent:
+                    window.set_visual(rgba_visual)
+                    window.set_app_paintable(True)
+
+                badge = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+                badge.set_border_width(30)
+                badge.set_halign(Gtk.Align.CENTER)
+                badge.set_valign(Gtk.Align.CENTER)
+                badge.get_style_context().add_class("badge")
+                window.add(badge)
+
                 css_provider = Gtk.CssProvider()
+                window_bg = b"rgba(0,0,0,0)" if transparent else b"#2196F3"
                 css_provider.load_from_data(b"""
                     window {
-                        background-color: #2196F3;
+                        background-color: %s;
                     }
-                    label {
+                    box.badge {
+                        background-color: rgba(33, 150, 243, 0.92);
+                        border-radius: 28px;
+                        padding: 24px 56px;
+                    }
+                    box.badge label {
                         color: white;
-                        font-size: 48px;
+                        font-size: 120px;
                         font-weight: bold;
                     }
-                    label.info {
-                        font-size: 18px;
+                    box.badge label.info {
+                        font-size: 24px;
                         font-weight: normal;
                     }
-                """)
-                
+                """ % window_bg)
+
                 style_context = window.get_style_context()
                 style_context.add_provider(css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-                
+                badge.get_style_context().add_provider(css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
                 # Monitor number
-                number_label = Gtk.Label(label=str(mon['index']))
-                number_label.get_style_context().add_class("number")
-                vbox.pack_start(number_label, True, True, 0)
-                
+                number_label = Gtk.Label(label=str(index))
+                badge.pack_start(number_label, True, True, 0)
+
                 # Monitor info
-                info_label = Gtk.Label(label=f"{mon['name']}\n{mon['width']}x{mon['height']}")
+                info_label = Gtk.Label(label=f"{name}\n{geo.width}x{geo.height}")
                 info_label.get_style_context().add_class("info")
-                vbox.pack_start(info_label, False, False, 0)
-                
+                badge.pack_start(info_label, False, False, 0)
+
                 # Close instruction
                 close_label = Gtk.Label(label="Press ESC or click to close")
                 close_label.get_style_context().add_class("info")
-                vbox.pack_start(close_label, False, False, 0)
-                
+                badge.pack_start(close_label, False, False, 0)
+
                 # Connect events
                 window.connect("button-press-event", lambda w, e: w.destroy())
                 window.connect("key-press-event", lambda w, e: w.destroy() if e.keyval == Gdk.KEY_Escape else None)
-                
+
                 window.show_all()
+                window.fullscreen_on_monitor(window.get_screen(), index)
                 id_windows.append(window)
-            
+
             # Auto-close after 5 seconds
             def close_all():
                 for w in id_windows:
                     if w.get_visible():
                         w.destroy()
                 return False
-            
+
             GLib.timeout_add_seconds(5, close_all)
-            
+
         except Exception as e:
             self.show_error(f"Error identifying monitors: {str(e)}")
     

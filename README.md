@@ -4,7 +4,7 @@ A combined VPN and RDP connection manager for Linux that allows you to connect t
 
 ## Features
 
-- **Dual VPN Protocol Support**: Works with both OpenVPN3 and WireGuard
+- **Multiple VPN Backends**: Works with NetworkManager VPN profiles, OpenVPN3, and WireGuard
 - **One-Click Connection**: Save VPN+RDP connection profiles and connect with a single click
 - **Connection Profiles**: Store multiple connection configurations with different VPN types and RDP settings
 - **Traffic Monitoring**: Real-time traffic charts for both OpenVPN3 and WireGuard connections
@@ -16,19 +16,27 @@ A combined VPN and RDP connection manager for Linux that allows you to connect t
 ## Requirements
 
 - Python 3 with GTK+ bindings
-- At least one VPN client:
-  - OpenVPN3 (`sudo apt install openvpn3`) - requires repository setup
-  - WireGuard (`sudo apt install wireguard`) - usually in standard repos
-- FreeRDP (`sudo apt install freerdp2-x11`)
+- At least one VPN backend:
+  - NetworkManager OpenVPN profiles, recommended on CachyOS/KDE
+  - OpenVPN3, useful on Debian/Ubuntu if already configured
+  - WireGuard
+- FreeRDP
 - Python keyring (optional, for secure password storage)
 
 ## Installation
 
-1. Make sure you have the required dependencies:
+1. Make sure you have the required dependencies.
+
+On CachyOS/Arch:
+```bash
+sudo pacman -S --needed python python-gobject gtk3 freerdp networkmanager-openvpn openvpn wireguard-tools
+```
+
+On Debian/Ubuntu/Linux Mint:
 ```bash
 sudo apt update
 sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0
-sudo apt install openvpn3 freerdp2-x11
+sudo apt install network-manager-openvpn freerdp2-x11
 # Optional for secure password storage:
 sudo apt install python3-keyring python3-secretstorage gnome-keyring
 ```
@@ -52,8 +60,12 @@ cp vpnrdp.desktop ~/.local/share/applications/
 2. **Create a new connection profile**:
    - Click "New Connection" button
    - Enter a name for your connection
-   - Select VPN type (OpenVPN3 or WireGuard)
+   - Select VPN type:
+     - NetworkManager on CachyOS/KDE for existing KDE VPN profiles
+     - OpenVPN3 if you imported configs with `openvpn3`
+     - WireGuard for `wg-quick` configs
    - Select your VPN configuration:
+     - For NetworkManager: Select an existing VPN profile name
      - For OpenVPN3: Select from imported configurations
      - For WireGuard: Select from .conf files in ~/.config/wireguard/ or /etc/wireguard/
    - Enter VPN username (for OpenVPN3)
@@ -76,7 +88,7 @@ cp vpnrdp.desktop ~/.local/share/applications/
 
 ## How It Works
 
-1. When you click connect, the app first establishes a VPN connection using OpenVPN3
+1. When you click connect, the app first establishes a VPN connection using the selected backend
 2. Once the VPN is connected, it automatically launches an RDP session using FreeRDP
 3. The connection status is monitored in real-time
 4. When you disconnect or close RDP, the VPN is also disconnected automatically
@@ -87,6 +99,9 @@ cp vpnrdp.desktop ~/.local/share/applications/
 - Passwords can be stored in the system keyring (if available) or prompted each time
 
 ## Importing VPN Configurations
+
+### NetworkManager
+On CachyOS/KDE, configure or import OpenVPN profiles in System Settings or the NetworkManager applet. The app will list NetworkManager VPN profiles by name.
 
 ### OpenVPN3
 Import your OpenVPN configurations:
@@ -108,7 +123,7 @@ The app will automatically detect WireGuard configurations in these directories.
 
 ## Troubleshooting
 
-- **Missing Dependencies**: The app will warn you if OpenVPN3 or FreeRDP are not installed
+- **Missing Dependencies**: The app detects Arch/CachyOS vs Debian/Ubuntu and shows package commands for that OS
 - **VPN Connection Failed**: Check your VPN credentials and ensure the VPN config is properly imported
 - **RDP Connection Failed**: Verify the RDP host is accessible from the VPN network
 - **Password Storage Issues**: Install python3-keyring for secure password storage
