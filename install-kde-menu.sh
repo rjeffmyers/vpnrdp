@@ -10,7 +10,13 @@ DESKTOP_DIR="${HOME}/.local/share/applications"
 DESKTOP_FILE="${DESKTOP_DIR}/vpnrdp.desktop"
 BIN_FILE="${BIN_DIR}/vpnrdp"
 
-echo "Installing VPN+RDP Manager for user: ${USER}"
+if [ -f "${APP_DIR}/vpnrdp.py" ]; then
+    ALREADY_INSTALLED=true
+    echo "Existing installation detected at ${APP_DIR}/vpnrdp.py — updating for user: ${USER}"
+else
+    ALREADY_INSTALLED=false
+    echo "Installing VPN+RDP Manager for user: ${USER}"
+fi
 
 mkdir -p "${APP_DIR}" "${BIN_DIR}" "${DESKTOP_DIR}"
 
@@ -49,7 +55,11 @@ elif command -v kbuildsycoca5 >/dev/null 2>&1; then
     kbuildsycoca5 --noincremental >/dev/null 2>&1 || true
 fi
 
-echo "Installed:"
+if $ALREADY_INSTALLED; then
+    echo "Update complete:"
+else
+    echo "Installed:"
+fi
 echo "  ${BIN_FILE}"
 echo "  ${DESKTOP_FILE}"
 echo ""

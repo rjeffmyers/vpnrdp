@@ -11,6 +11,31 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
+INSTALL_TARGET="/usr/local/bin/vpnrdp"
+MODE="auto"   # auto | update | reinstall
+
+usage() {
+    cat <<EOF
+Usage: sudo ./install.sh [OPTION]
+
+  (no option)   Auto: fresh install runs dependency setup; if already
+                installed, updates the app files only.
+  --update      Update app files only, always skip dependency setup.
+  --reinstall   Reinstall, always run dependency setup (incl. system update).
+  -h, --help    Show this help.
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --update)    MODE="update" ;;
+        --reinstall) MODE="reinstall" ;;
+        -h|--help)   usage; exit 0 ;;
+        *) echo -e "${RED}Unknown option: $1${NC}"; usage; exit 1 ;;
+    esac
+    shift
+done
+
 echo -e "${BLUE}========================================${NC}"
 echo -e "${BLUE}VPN+RDP Manager Installer${NC}"
 echo -e "${BLUE}========================================${NC}"
@@ -20,6 +45,38 @@ if [ "$EUID" -ne 0 ]; then
    echo -e "${RED}This installer must be run as root (use sudo)${NC}"
    exit 1
 fi
+
+# Detect an existing installation and decide whether to run dependency setup.
+# Covers both the system install (this script) and the per-user KDE install
+# (install-kde-menu.sh -> ~/.local/share/vpnrdp/vpnrdp.py).
+ALREADY_INSTALLED=false
+[ -f "$INSTALL_TARGET" ] && ALREADY_INSTALLED=true
+
+USER_APP=""
+if [ -n "$SUDO_USER" ]; then
+    USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+    if [ -f "$USER_HOME/.local/share/vpnrdp/vpnrdp.py" ]; then
+        USER_APP="$USER_HOME/.local/share/vpnrdp/vpnrdp.py"
+        ALREADY_INSTALLED=true
+    fi
+fi
+
+RUN_DEPS=true
+case "$MODE" in
+    reinstall) RUN_DEPS=true ;;
+    update)    RUN_DEPS=false ;;
+    auto)      if $ALREADY_INSTALLED; then RUN_DEPS=false; else RUN_DEPS=true; fi ;;
+esac
+
+if $ALREADY_INSTALLED; then
+    echo -e "${YELLOW}Existing installation detected at ${INSTALL_TARGET} — updating application files.${NC}"
+    if ! $RUN_DEPS; then
+        echo -e "${YELLOW}Skipping dependency setup (run with --reinstall to force it).${NC}"
+    fi
+else
+    echo -e "${GREEN}Performing a fresh installation.${NC}"
+fi
+echo ""
 
 detect_os_family() {
     local os_id=""
@@ -121,23 +178,29 @@ install_debian_dependencies() {
     fi
 }
 
-OS_FAMILY=$(detect_os_family)
-echo "Detected OS family: $OS_FAMILY"
+if $RUN_DEPS; then
+    OS_FAMILY=$(detect_os_family)
+    echo "Detected OS family: $OS_FAMILY"
 
-case "$OS_FAMILY" in
-    arch)
-        install_arch_dependencies
-        ;;
-    debian)
-        install_debian_dependencies
-        ;;
-    *)
-        echo -e "${YELLOW}Unknown OS family. Skipping dependency installation.${NC}"
-        echo "Install Python GTK bindings, FreeRDP, and a VPN backend manually."
-        ;;
-esac
+    case "$OS_FAMILY" in
+        arch)
+            install_arch_dependencies
+            ;;
+        debian)
+            install_debian_dependencies
+            ;;
+        *)
+            echo -e "${YELLOW}Unknown OS family. Skipping dependency installation.${NC}"
+            echo "Install Python GTK bindings, FreeRDP, and a VPN backend manually."
+            ;;
+    esac
+fi
 
-echo -e "${YELLOW}Installing VPN+RDP Manager...${NC}"
+if $ALREADY_INSTALLED; then
+    echo -e "${YELLOW}Updating VPN+RDP Manager...${NC}"
+else
+    echo -e "${YELLOW}Installing VPN+RDP Manager...${NC}"
+fi
 
 mkdir -p /usr/local/bin
 mkdir -p /usr/share/applications
@@ -155,13 +218,27 @@ if [ -n "$SUDO_USER" ]; then
     USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
     mkdir -p "$USER_HOME/.config/vpnrdp"
     chown -R "$SUDO_USER:$SUDO_USER" "$USER_HOME/.config/vpnrdp"
+
+    # Also refresh a per-user KDE install (install-kde-menu.sh), which is what
+    # the application menu launches via ~/.local/bin/vpnrdp.
+    if [ -n "$USER_APP" ]; then
+        echo -e "${YELLOW}Updating per-user install at ${USER_APP}${NC}"
+        install -m 755 vpnrdp.py "$USER_APP"
+        chown "$SUDO_USER:" "$USER_APP"
+        install -m 644 README.md "$(dirname "$USER_APP")/README.md" 2>/dev/null \
+            && chown "$SUDO_USER:" "$(dirname "$USER_APP")/README.md" || true
+    fi
 fi
 
 update-desktop-database 2>/dev/null || true
 
 echo ""
 echo -e "${GREEN}========================================${NC}"
-echo -e "${GREEN}Installation Complete!${NC}"
+if $ALREADY_INSTALLED; then
+    echo -e "${GREEN}Update Complete!${NC}"
+else
+    echo -e "${GREEN}Installation Complete!${NC}"
+fi
 echo -e "${GREEN}========================================${NC}"
 echo ""
 

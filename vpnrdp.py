@@ -31,7 +31,100 @@ import time
 import signal
 import re
 import sys
+import shlex
 from collections import deque
+
+
+def find_freerdp_cmd():
+    """Return the available xfreerdp executable name, or None."""
+    if shutil.which("xfreerdp3"):
+        return "xfreerdp3"
+    if shutil.which("xfreerdp"):
+        return "xfreerdp"
+    return None
+
+
+def build_rdp_command(conn, freerdp_cmd, rdp_password):
+    """Build the xfreerdp argument list from a connection dict.
+
+    rdp_password is embedded as-is in /p:... ; pass None to omit the /p: flag
+    entirely (e.g. for a preview, so the password is entered at the runtime prompt).
+    """
+    cmd = [freerdp_cmd]
+    cmd.append(f"/v:{conn.get('rdp_host', '')}")
+
+    rdp_username = conn.get("rdp_username", "")
+    rdp_domain = conn.get("rdp_domain", "")
+    if rdp_domain:
+        cmd.append(f"/u:{rdp_username}")
+        cmd.append(f"/d:{rdp_domain}")
+    else:
+        cmd.append(f"/u:{rdp_username}")
+
+    if rdp_password is not None:
+        cmd.append(f"/p:{rdp_password}")
+
+    # Display options
+    if conn.get("rdp_fullscreen", True):
+        cmd.append("/f")
+    else:
+        resolution = conn.get("rdp_resolution", "1920x1080")
+        cmd.append(f"/size:{resolution}")
+
+    # Multi-monitor support
+    if conn.get("multimon", False):
+        cmd.append("/multimon")
+
+        # Specific monitors if selected
+        selected_monitors = conn.get("selected_monitors", [])
+        if selected_monitors:
+            monitors_str = ",".join(str(m) for m in selected_monitors)
+            cmd.extend([f"/monitors:{monitors_str}"])
+
+    # Performance flags
+    if conn.get("disable_fonts", True):
+        cmd.append("+fonts")
+    if conn.get("disable_wallpaper", True):
+        cmd.append("-wallpaper")
+    if conn.get("disable_themes", True):
+        cmd.append("-themes")
+    if conn.get("disable_aero", True):
+        cmd.append("+aero")
+    if conn.get("disable_drag", False):
+        cmd.append("-window-drag")
+
+    # Audio settings
+    audio_mode = conn.get("audio_mode", "local")
+    if audio_mode == "local":
+        cmd.append("/sound")
+    elif audio_mode == "remote":
+        cmd.append("/audio-mode:1")
+    elif audio_mode == "disabled":
+        cmd.append("/audio-mode:2")
+
+    # Clipboard
+    if conn.get("clipboard", True):
+        cmd.append("+clipboard")
+
+    # Drive redirection
+    if conn.get("redirect_drives", False):
+        home_dir = os.path.expanduser("~")
+        cmd.extend([f"/drive:home,{home_dir}"])
+
+    # Certificate acceptance
+    cmd.append("/cert:ignore")
+
+    # Network level authentication
+    if conn.get("nla", True):
+        cmd.append("/sec:nla")
+    else:
+        cmd.append("/sec:rdp")
+
+    # Compression
+    if conn.get("compression", True):
+        cmd.append("+compression")
+
+    return cmd
 
 
 def suppress_appindicator_deprecation_warning(log_domain, log_level, message):
@@ -375,7 +468,15 @@ class VPNRDPManager(Gtk.Window):
         self.connect_button = Gtk.Button(label="Connect")
         self.connect_button.connect("clicked", self.connect_selected)
         button_box.pack_start(self.connect_button, True, True, 0)
-        
+
+        # Connect with debug log button
+        self.connect_debug_button = Gtk.Button(label="Connect (Debug Log)")
+        self.connect_debug_button.set_tooltip_text(
+            "Connect with xfreerdp /log-level:TRACE and show a live log window"
+        )
+        self.connect_debug_button.connect("clicked", self.connect_selected_debug)
+        button_box.pack_start(self.connect_debug_button, True, True, 0)
+
         # Disconnect button
         self.disconnect_button = Gtk.Button(label="Disconnect")
         self.disconnect_button.connect("clicked", self.disconnect_selected)
@@ -391,6 +492,7 @@ class VPNRDPManager(Gtk.Window):
         self.config_file = os.path.expanduser("~/.config/vpnrdp/connections.json")
         self.connections = self.load_connections()
         self.active_connections = {}  # Track active VPN sessions and RDP processes
+        self.rdp_log_buffers = {}  # name -> (textview, buffer) for live debug logs
         self.current_vpn_session = None
         self.current_rdp_process = None
         
@@ -709,15 +811,22 @@ class VPNRDPManager(Gtk.Window):
     
     def connect_selected(self, widget):
         """Connect to selected VPN+RDP"""
+        self._connect_selected(debug=False)
+
+    def connect_selected_debug(self, widget):
+        """Connect to selected VPN+RDP with a live TRACE log window"""
+        self._connect_selected(debug=True)
+
+    def _connect_selected(self, debug=False):
         selection = self.treeview.get_selection()
         model, iter = selection.get_selected()
-        
+
         if iter:
             name = model.get_value(iter, 0)
             if name in self.connections:
-                self.connect_to(name)
-    
-    def connect_to(self, name):
+                self.connect_to(name, debug=debug)
+
+    def connect_to(self, name, debug=False):
         """Connect to a specific connection profile"""
         if name not in self.connections:
             return
@@ -730,23 +839,25 @@ class VPNRDPManager(Gtk.Window):
         
         conn = self.connections[name]
         
-        # Disable connect button to prevent multiple clicks
+        # Disable connect buttons to prevent multiple clicks
         self.connect_button.set_sensitive(False)
+        self.connect_debug_button.set_sensitive(False)
         
         # Update status
         self.update_connection_status(name, "Connecting...")
         self.update_status(f"Connecting to {name}...")
         
         # Show connecting dialog
-        self.show_connecting_dialog(name, conn)
-    
-    def show_connecting_dialog(self, name, conn):
+        self.show_connecting_dialog(name, conn, debug=debug)
+
+    def show_connecting_dialog(self, name, conn, debug=False):
         """Show a dialog while connecting"""
         conn = dict(conn)
         if not self.collect_connection_passwords(name, conn):
             self.update_connection_status(name, "Canceled")
             self.update_status("Connection canceled")
             self.connect_button.set_sensitive(True)
+            self.connect_debug_button.set_sensitive(True)
             return
 
         dialog = Gtk.Dialog(
@@ -818,7 +929,7 @@ class VPNRDPManager(Gtk.Window):
         self.connecting_thread_done = False
         
         # Start connection in background thread
-        thread = threading.Thread(target=self.connection_worker_with_dialog, args=(name, conn, dialog))
+        thread = threading.Thread(target=self.connection_worker_with_dialog, args=(name, conn, dialog, debug))
         thread.daemon = True
         thread.start()
         
@@ -831,10 +942,12 @@ class VPNRDPManager(Gtk.Window):
                 self.disconnect(name)
             self.update_connection_status(name, "Canceled")
             self.update_status("Connection canceled")
-            self.connect_button.set_sensitive(True)  # Re-enable connect button
+            self.connect_button.set_sensitive(True)  # Re-enable connect buttons
+            self.connect_debug_button.set_sensitive(True)
         elif response != Gtk.ResponseType.OK:
             # Connection failed or dialog closed
-            self.connect_button.set_sensitive(True)  # Re-enable connect button
+            self.connect_button.set_sensitive(True)  # Re-enable connect buttons
+            self.connect_debug_button.set_sensitive(True)
 
         self.connecting_canceled = True
         
@@ -881,7 +994,7 @@ class VPNRDPManager(Gtk.Window):
         self.connecting_progress.set_fraction(fraction)
         return False
     
-    def connection_worker_with_dialog(self, name, conn, dialog):
+    def connection_worker_with_dialog(self, name, conn, dialog, debug=False):
         """Worker thread for establishing connection with dialog updates"""
         try:
             connection_mode = conn.get("connection_mode", "VPN+RDP")
@@ -923,7 +1036,7 @@ class VPNRDPManager(Gtk.Window):
                     return
                 
                 # Connect to RDP directly
-                rdp_success = self.connect_rdp(name, conn)
+                rdp_success = self.connect_rdp(name, conn, debug=debug)
                 
                 if rdp_success:
                     GLib.idle_add(self.safe_set_connecting_status, dialog, "RDP connection established successfully!")
@@ -979,7 +1092,7 @@ class VPNRDPManager(Gtk.Window):
                     return
                 
                 # Connect to RDP
-                rdp_success = self.connect_rdp(name, conn)
+                rdp_success = self.connect_rdp(name, conn, debug=debug)
                 
                 if rdp_success:
                     GLib.idle_add(self.safe_set_connecting_status, dialog, "Connection established successfully!")
@@ -1217,110 +1330,95 @@ class VPNRDPManager(Gtk.Window):
             print(f"WireGuard connection error: {e}")
             return False
     
-    def connect_rdp(self, name, conn):
+    def ensure_ntlm_krb5_config(self):
+        """Return a krb5.conf path that disables Kerberos KDC discovery.
+
+        Pointing KRB5_CONFIG at this for the xfreerdp process makes NLA/CredSSP
+        skip Kerberos and fall straight to NTLM, avoiding the stall from
+        unreachable domain controllers over a VPN.
+        """
+        path = os.path.join(os.path.dirname(self.config_file), "krb5-nokdc.conf")
+        content = (
+            "# Generated by vpnrdp: disables Kerberos KDC discovery so NLA falls\n"
+            "# back to NTLM immediately. Used only for connections with Force NTLM.\n"
+            "[libdefaults]\n"
+            "    dns_lookup_kdc = false\n"
+            "    dns_lookup_realm = false\n"
+        )
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            # Only write if missing or changed, so we don't churn the file.
+            if not os.path.exists(path) or open(path).read() != content:
+                with open(path, "w") as f:
+                    f.write(content)
+        except Exception as e:
+            print(f"Could not write NTLM krb5 config: {e}")
+        return path
+
+    def connect_rdp(self, name, conn, debug=False):
         """Connect to RDP"""
         rdp_host = conn.get("rdp_host")
         rdp_username = conn.get("rdp_username")
         rdp_domain = conn.get("rdp_domain", "")
         rdp_password = conn.get("_rdp_password")
-        
+
         if not rdp_host:
             return False
         if rdp_password is None:
             print("RDP password was not collected before worker startup")
             return False
-        
+
         # Find xfreerdp command
-        freerdp_cmd = None
-        if shutil.which("xfreerdp3"):
-            freerdp_cmd = "xfreerdp3"
-        elif shutil.which("xfreerdp"):
-            freerdp_cmd = "xfreerdp"
-        
+        freerdp_cmd = find_freerdp_cmd()
+
         if not freerdp_cmd:
             return False
-        
+
         try:
             # Build RDP command
-            cmd = [freerdp_cmd]
-            cmd.append(f"/v:{rdp_host}")
-            
-            if rdp_domain:
-                cmd.append(f"/u:{rdp_username}")
-                cmd.append(f"/d:{rdp_domain}")
+            cmd = build_rdp_command(conn, freerdp_cmd, rdp_password)
+            if debug:
+                cmd.append("/log-level:TRACE")
+
+            # Force NTLM by pointing krb5 at a config that disables KDC discovery,
+            # avoiding the multi-second NLA stall when KDCs are unreachable over VPN.
+            env = None
+            env_prefix = ""
+            if conn.get("force_ntlm", False):
+                krb5_path = self.ensure_ntlm_krb5_config()
+                env = dict(os.environ)
+                env["KRB5_CONFIG"] = krb5_path
+                env_prefix = f"KRB5_CONFIG={shlex.quote(krb5_path)} "
+
+            if debug:
+                # Open the live log window and merge stderr into stdout so a
+                # single reader thread can stream the whole TRACE log.
+                display_cmd = env_prefix + " ".join(
+                    shlex.quote(c) for c in build_rdp_command(conn, freerdp_cmd, None)
+                ) + " /log-level:TRACE"
+                GLib.idle_add(self.open_rdp_log_window, name, display_cmd)
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    env=env
+                )
+                reader = threading.Thread(
+                    target=self.stream_rdp_log, args=(name, proc), daemon=True
+                )
+                reader.start()
             else:
-                cmd.append(f"/u:{rdp_username}")
-            
-            cmd.append(f"/p:{rdp_password}")
-            
-            # Display options
-            if conn.get("rdp_fullscreen", True):
-                cmd.append("/f")
-            else:
-                resolution = conn.get("rdp_resolution", "1920x1080")
-                cmd.append(f"/size:{resolution}")
-            
-            # Multi-monitor support
-            if conn.get("multimon", False):
-                cmd.append("/multimon")
-                
-                # Specific monitors if selected
-                selected_monitors = conn.get("selected_monitors", [])
-                if selected_monitors:
-                    monitors_str = ",".join(str(m) for m in selected_monitors)
-                    cmd.extend([f"/monitors:{monitors_str}"])
-            
-            # Performance flags
-            if conn.get("disable_fonts", True):
-                cmd.append("+fonts")
-            if conn.get("disable_wallpaper", True):
-                cmd.append("-wallpaper")
-            if conn.get("disable_themes", True):
-                cmd.append("-themes")
-            if conn.get("disable_aero", True):
-                cmd.append("+aero")
-            if conn.get("disable_drag", False):
-                cmd.append("-window-drag")
-            
-            # Audio settings
-            audio_mode = conn.get("audio_mode", "local")
-            if audio_mode == "local":
-                cmd.append("/sound")
-            elif audio_mode == "remote":
-                cmd.append("/audio-mode:1")
-            elif audio_mode == "disabled":
-                cmd.append("/audio-mode:2")
-            
-            # Clipboard
-            if conn.get("clipboard", True):
-                cmd.append("+clipboard")
-            
-            # Drive redirection
-            if conn.get("redirect_drives", False):
-                home_dir = os.path.expanduser("~")
-                cmd.extend([f"/drive:home,{home_dir}"])
-            
-            # Certificate acceptance
-            cmd.append("/cert:ignore")
-            
-            # Network level authentication
-            if conn.get("nla", True):
-                cmd.append("/sec:nla")
-            else:
-                cmd.append("/sec:rdp")
-            
-            # Compression
-            if conn.get("compression", True):
-                cmd.append("+compression")
-            
-            # Start RDP process
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            
+                # Start RDP process
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=env
+                )
+
             # Check if it started successfully
             time.sleep(2)
             if proc.poll() is None:
@@ -1340,7 +1438,144 @@ class VPNRDPManager(Gtk.Window):
         except Exception as e:
             print(f"RDP connection error: {e}")
             return False
-    
+
+    # --- Debug log window ---------------------------------------------------
+
+    def open_rdp_log_window(self, name, command_str):
+        """Create a non-modal window that streams the xfreerdp TRACE log.
+
+        Runs on the GTK main thread (via GLib.idle_add).
+        """
+        existing = self.rdp_log_buffers.get(name)
+        if existing:
+            existing["window"].present()
+            return False
+
+        win = Gtk.Window(title=f"RDP Debug Log — {name}")
+        win.set_default_size(900, 500)
+        win.set_transient_for(self)
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        vbox.set_border_width(6)
+        win.add(vbox)
+
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        tv = Gtk.TextView()
+        tv.set_editable(False)
+        tv.set_cursor_visible(False)
+        tv.set_monospace(True)
+        tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        buf = tv.get_buffer()
+        buf.set_text(f"$ {command_str}\n\n")
+        sw.add(tv)
+        vbox.pack_start(sw, True, True, 0)
+
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        vbox.pack_start(btn_box, False, False, 0)
+
+        autoscroll_check = Gtk.CheckButton(label="Auto-scroll")
+        autoscroll_check.set_active(True)
+        btn_box.pack_start(autoscroll_check, False, False, 0)
+
+        close_btn = Gtk.Button(label="Close")
+        close_btn.connect("clicked", lambda b: win.destroy())
+        btn_box.pack_end(close_btn, False, False, 0)
+
+        save_btn = Gtk.Button(label="Save…")
+        save_btn.connect("clicked", self.on_save_rdp_log, name)
+        btn_box.pack_end(save_btn, False, False, 0)
+
+        copy_btn = Gtk.Button(label="Copy")
+        copy_btn.connect("clicked", self.on_copy_rdp_log, name)
+        btn_box.pack_end(copy_btn, False, False, 0)
+
+        win.connect("destroy", self.on_rdp_log_window_destroy, name)
+
+        self.rdp_log_buffers[name] = {
+            "view": tv,
+            "buffer": buf,
+            "window": win,
+            "autoscroll": autoscroll_check,
+        }
+        win.show_all()
+        return False
+
+    def stream_rdp_log(self, name, proc):
+        """Reader thread: pump xfreerdp output into the log window line by line."""
+        try:
+            if proc.stdout is not None:
+                for line in proc.stdout:
+                    GLib.idle_add(self.append_rdp_log, name, line)
+        except Exception as e:
+            GLib.idle_add(self.append_rdp_log, name, f"\n[log reader error: {e}]\n")
+        finally:
+            rc = proc.poll()
+            GLib.idle_add(
+                self.append_rdp_log, name,
+                f"\n[xfreerdp process exited, return code {rc}]\n"
+            )
+
+    def append_rdp_log(self, name, text):
+        """Append a line to the log window and (optionally) auto-scroll. Main thread."""
+        entry = self.rdp_log_buffers.get(name)
+        if not entry:
+            return False
+        buf = entry["buffer"]
+        buf.insert(buf.get_end_iter(), text)
+
+        # Cap the buffer so a long TRACE session can't grow without bound.
+        max_lines = 5000
+        line_count = buf.get_line_count()
+        if line_count > max_lines:
+            trim_end = buf.get_iter_at_line(line_count - max_lines)
+            buf.delete(buf.get_start_iter(), trim_end)
+
+        if entry["autoscroll"].get_active():
+            entry["view"].scroll_to_iter(buf.get_end_iter(), 0.0, False, 0.0, 0.0)
+        return False
+
+    def on_copy_rdp_log(self, widget, name):
+        """Copy the full log to the clipboard."""
+        entry = self.rdp_log_buffers.get(name)
+        if not entry:
+            return
+        buf = entry["buffer"]
+        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        clipboard.set_text(text, -1)
+        clipboard.store()
+
+    def on_save_rdp_log(self, widget, name):
+        """Save the log to a file."""
+        entry = self.rdp_log_buffers.get(name)
+        if not entry:
+            return
+        chooser = Gtk.FileChooserDialog(
+            title="Save RDP Log",
+            transient_for=entry["window"],
+            action=Gtk.FileChooserAction.SAVE
+        )
+        chooser.add_buttons(
+            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+            Gtk.STOCK_SAVE, Gtk.ResponseType.OK
+        )
+        chooser.set_current_name(f"{name}-rdp-trace.log")
+        if chooser.run() == Gtk.ResponseType.OK:
+            path = chooser.get_filename()
+            buf = entry["buffer"]
+            text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+            try:
+                with open(path, "w") as f:
+                    f.write(text)
+            except Exception as e:
+                self.show_error(f"Could not save log: {e}")
+        chooser.destroy()
+
+    def on_rdp_log_window_destroy(self, widget, name):
+        """Forget a log window once it is closed."""
+        self.rdp_log_buffers.pop(name, None)
+
     def disconnect_selected(self, widget):
         """Disconnect selected connection"""
         selection = self.treeview.get_selection()
@@ -1466,6 +1701,7 @@ class VPNRDPManager(Gtk.Window):
     def update_buttons(self, connected):
         """Update button states"""
         self.connect_button.set_sensitive(not connected)
+        self.connect_debug_button.set_sensitive(not connected)
         self.disconnect_button.set_sensitive(connected)
     
     def get_password(self, name, service_type):
@@ -2398,7 +2634,29 @@ class ConnectionDialog(Gtk.Dialog):
         self.nla_check = Gtk.CheckButton(label="Network Level Authentication (NLA)")
         self.nla_check.set_active(self.connection_data.get("nla", True))
         security_box.pack_start(self.nla_check, False, False, 0)
-        
+
+        self.force_ntlm_check = Gtk.CheckButton(
+            label="Force NTLM (skip Kerberos)"
+        )
+        self.force_ntlm_check.set_tooltip_text(
+            "Disable Kerberos KDC discovery for this connection. Fixes long pauses "
+            "before the desktop appears when domain controllers are unreachable over VPN."
+        )
+        self.force_ntlm_check.set_active(self.connection_data.get("force_ntlm", False))
+        security_box.pack_start(self.force_ntlm_check, False, False, 0)
+
+        # Command Preview Frame
+        cmd_frame = Gtk.Frame(label="Command Preview")
+        advanced_vbox.pack_start(cmd_frame, False, False, 0)
+
+        cmd_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        cmd_box.set_border_width(10)
+        cmd_frame.add(cmd_box)
+
+        show_cmd_btn = Gtk.Button(label="Show Command")
+        show_cmd_btn.connect("clicked", self.show_command_preview)
+        cmd_box.pack_start(show_cmd_btn, False, False, 0)
+
         # Add Advanced tab to notebook
         notebook.append_page(advanced_scrolled, Gtk.Label(label="Advanced"))
         
@@ -2686,9 +2944,66 @@ class ConnectionDialog(Gtk.Dialog):
             "audio_mode": audio_mode,
             "clipboard": self.clipboard_check.get_active(),
             "redirect_drives": self.drives_check.get_active(),
-            "nla": self.nla_check.get_active()
+            "nla": self.nla_check.get_active(),
+            "force_ntlm": self.force_ntlm_check.get_active()
         }
     
+    def show_command_preview(self, widget=None):
+        """Show the xfreerdp command line for the current options in a copyable popup."""
+        data = self.get_connection_data()
+        if data is None:
+            # get_connection_data already showed the validation error
+            return
+
+        if data.get("connection_mode") == "VPN Only":
+            self.show_info("This connection has no RDP component, so there is no xfreerdp command.")
+            return
+
+        freerdp_cmd = find_freerdp_cmd() or "xfreerdp3"
+        # Omit the password flag: the user enters it at the xfreerdp runtime prompt.
+        cmd = build_rdp_command(data, freerdp_cmd, None)
+
+        # Shell-quote each token so the command can be pasted into a terminal as-is.
+        cmd_str = " ".join(shlex.quote(c) for c in cmd)
+
+        # Mirror the KRB5_CONFIG override the app applies for Force NTLM.
+        if data.get("force_ntlm", False):
+            krb5_path = os.path.expanduser("~/.config/vpnrdp/krb5-nokdc.conf")
+            cmd_str = f"KRB5_CONFIG={shlex.quote(krb5_path)} " + cmd_str
+
+        self._show_copyable_text("xfreerdp Command", cmd_str)
+
+    def _show_copyable_text(self, title, text):
+        """Show text in a read-only, selectable popup with a copy-to-clipboard button."""
+        dlg = Gtk.Dialog(title=title, transient_for=self)
+        dlg.set_default_size(700, 220)
+        dlg.add_button("Copy to Clipboard", 1)
+        dlg.add_button(Gtk.STOCK_CLOSE, Gtk.ResponseType.CLOSE)
+
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+
+        tv = Gtk.TextView()
+        tv.set_editable(False)
+        tv.set_cursor_visible(True)
+        tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        tv.set_monospace(True)
+        tv.get_buffer().set_text(text)
+        sw.add(tv)
+
+        dlg.get_content_area().pack_start(sw, True, True, 0)
+        dlg.show_all()
+
+        while True:
+            resp = dlg.run()
+            if resp == 1:  # Copy to Clipboard
+                clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+                clipboard.set_text(text, -1)
+                clipboard.store()
+            else:
+                break
+        dlg.destroy()
+
     def identify_monitors(self, widget=None):
         """Show a numbered overlay on each monitor."""
         try:
