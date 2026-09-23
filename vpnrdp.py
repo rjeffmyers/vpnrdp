@@ -44,6 +44,32 @@ def find_freerdp_cmd():
     return None
 
 
+def list_freerdp_monitors(freerdp_cmd):
+    """Return FreeRDP's own monitor list as [(id, x, y, width, height), ...].
+
+    These IDs are what /monitors: expects; they do not necessarily match
+    GDK's monitor indices. Returns [] if the list cannot be obtained.
+    """
+    if not freerdp_cmd:
+        return []
+    # FreeRDP 3 uses /list:monitor; FreeRDP 2 uses /monitor-list
+    for flag in ("/list:monitor", "/monitor-list"):
+        try:
+            result = subprocess.run([freerdp_cmd, flag], capture_output=True,
+                                    text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        monitors = []
+        for line in result.stdout.splitlines():
+            m = re.search(r"\[(\d+)\].*?(\d+)x(\d+)\s*\+(-?\d+)\+(-?\d+)", line)
+            if m:
+                mid, w, h, x, y = (int(v) for v in m.groups())
+                monitors.append((mid, x, y, w, h))
+        if monitors:
+            return monitors
+    return []
+
+
 def build_rdp_command(conn, freerdp_cmd, rdp_password):
     """Build the xfreerdp argument list from a connection dict.
 
@@ -3017,6 +3043,11 @@ class ConnectionDialog(Gtk.Dialog):
                 self.show_info("No monitors detected")
                 return
 
+            # Label each monitor with FreeRDP's ID (what /monitors: expects),
+            # matched to GDK monitors by position. GDK's index order can differ.
+            rdp_ids = {(x, y): mid for mid, x, y, w, h
+                       in list_freerdp_monitors(find_freerdp_cmd())}
+
             # Create identification windows
             id_windows = []
 
@@ -3024,9 +3055,13 @@ class ConnectionDialog(Gtk.Dialog):
                 monitor = display.get_monitor(index)
                 geo = monitor.get_geometry()
                 name = monitor.get_model() or f"Output {index}"
+                if rdp_ids:
+                    label = str(rdp_ids.get((geo.x, geo.y), "?"))
+                else:
+                    label = str(index)
 
                 window = Gtk.Window()
-                window.set_title(f"Monitor {index}")
+                window.set_title(f"Monitor {label}")
                 window.set_decorated(False)
                 window.set_keep_above(True)
 
@@ -3071,7 +3106,7 @@ class ConnectionDialog(Gtk.Dialog):
                 badge.get_style_context().add_provider(css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
                 # Monitor number
-                number_label = Gtk.Label(label=str(index))
+                number_label = Gtk.Label(label=label)
                 badge.pack_start(number_label, True, True, 0)
 
                 # Monitor info
